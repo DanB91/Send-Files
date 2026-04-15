@@ -1,6 +1,9 @@
 #+feature dynamic-literals
 package main
 
+import im "3rdparty/imgui"
+import "3rdparty/imgui/imgui_impl_sdl3"
+import "3rdparty/imgui/imgui_impl_sdlgpu3"
 import "base:runtime"
 import "core:crypto"
 import "core:fmt"
@@ -8,16 +11,17 @@ import "core:math/rand"
 import "core:nbio"
 import "core:os"
 import "core:prof/spall"
+import "core:strings"
 import "core:sync"
 import "core:thread"
-import "vendor:microui"
 import "vendor:sdl3"
 
-INITIAL_WINDOW_WIDTH :: 600
-INITIAL_WINDOW_HEIGHT :: 600
+INITIAL_WINDOW_WIDTH :: 800
+INITIAL_WINDOW_HEIGHT :: 800
 FONT_MULTIPLIER :: 1
 
 ENABLE_PROFILING :: false
+ENABLE_DOCKING :: false
 
 main :: proc() {
 	lane_count := os.get_processor_core_count()
@@ -30,7 +34,7 @@ main :: proc() {
 	temp_tls.lane_count = lane_count
 	temp_tls.barrier = &bootstrap_barrier
 
-	if ENABLE_PROFILING {
+	when ENABLE_PROFILING {
 		g.spall_ctx = spall.context_create("trace_test.spall")
 	}
 
@@ -41,7 +45,7 @@ main :: proc() {
 		temp_tls.lane_id = i
 		temp_tls.g = g
 
-		if ENABLE_PROFILING {
+		when ENABLE_PROFILING {
 			buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
 			// defer delete(buffer_backing)
 			temp_tls.spall_buffer = new(spall.Buffer)
@@ -55,7 +59,7 @@ main :: proc() {
 
 	temp_tls.lane_id = 0 //lane id 0 is always main thread
 
-	if ENABLE_PROFILING {
+	when ENABLE_PROFILING {
 		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
 		temp_tls.spall_buffer = new(spall.Buffer)
 		temp_tls.spall_buffer^ = spall.buffer_create(buffer_backing, 0)
@@ -64,10 +68,10 @@ main :: proc() {
 	multithread_entry_point(temp_tls)
 
 	thread.join_multiple(..threads)
-	for buffer in spall_buffers {
-		spall.buffer_destroy(&g.spall_ctx, buffer)
-	}
-	if ENABLE_PROFILING {
+	when ENABLE_PROFILING {
+		for buffer in spall_buffers {
+			spall.buffer_destroy(&g.spall_ctx, buffer)
+		}
 		spall.buffer_destroy(&g.spall_ctx, temp_tls.spall_buffer)
 
 
@@ -82,6 +86,18 @@ multithread_entry_point :: proc(tls_context: TLS) {
 
 
 	if is_main_thread() {
+		im.CHECKVERSION()
+		im.CreateContext()
+		g.im_io = im.GetIO()
+		g.im_io.ConfigFlags += {.NavEnableKeyboard}
+		g.im_io.IniFilename = nil
+		when ENABLE_DOCKING {
+			g.im_io.ConfigFlags += {.DockingEnable, .ViewportsEnable}
+			style := im.GetStyle()
+			style.WindowRounding = 0
+			style.Colors[im.Col.WindowBg].w = 1
+		}
+
 
 		//initialize SDL3
 		success := sdl3.Init({.VIDEO, .EVENTS})
@@ -90,15 +106,51 @@ multithread_entry_point :: proc(tls_context: TLS) {
 		g.window_height = INITIAL_WINDOW_HEIGHT
 		g.window = sdl3.CreateWindow("Send Files", g.window_width, g.window_height, {.RESIZABLE})
 		ensure(g.window != nil)
-		g.renderer = sdl3.CreateRenderer(g.window, nil)
-		ensure(g.renderer != nil)
+		g.gpu_device = sdl3.CreateGPUDevice({.SPIRV, .DXIL, .METALLIB}, false, nil)
+		ensure(g.gpu_device != nil)
+		success = sdl3.ClaimWindowForGPUDevice(g.gpu_device, g.window)
+		ensure(success)
+		success = sdl3.SetGPUSwapchainParameters(g.gpu_device, g.window, .SDR, .VSYNC)
+		ensure(success)
 
-		init_micro_context(g)
-		init_microui_atlas()
+		//init imgui
+		imgui_impl_sdl3.InitForSDLGPU(g.window)
+		init_info := imgui_impl_sdlgpu3.InitInfo {
+			Device               = g.gpu_device,
+			ColorTargetFormat    = sdl3.GetGPUSwapchainTextureFormat(g.gpu_device, g.window),
+			MSAASamples          = ._1,
+			PresentMode          = .VSYNC,
+			SwapchainComposition = .SDR,
+		}
+		imgui_impl_sdlgpu3.Init(&init_info)
+
 
 		//init placeholder values.  TODO: remove
 		append(&g.contacts, Contact{"Alice", "98765"})
 		append(&g.contacts, Contact{"Bob", "654321"})
+
+		append(
+			&g.transfers,
+			Transfer {
+				"Handmade Hero Episode 1.mp4",
+				1234567890,
+				Contact{"Bob", "654321"},
+				.NotStarted,
+				nil,
+				0,
+			},
+		)
+		append(
+			&g.transfers,
+			Transfer {
+				"Handmade Hero Episode 2.mp4",
+				1234567890,
+				Contact{"Bob", "654321"},
+				.NotStarted,
+				nil,
+				0,
+			},
+		)
 	}
 	lane_sync()
 
@@ -113,62 +165,129 @@ multithread_entry_point :: proc(tls_context: TLS) {
 
 }
 build_gui :: proc(g: ^G) {
-	mu_textf :: proc(ctx: ^microui.Context, f: string, args: ..any) {
-		text := fmt.tprintf(f, ..args)
-		microui.text(ctx, text)
+	cstr :: proc(s: string) -> cstring {
+		return strings.clone_to_cstring(s)
 	}
-	mu_ctx := &g.microui_context
-	microui.begin(mu_ctx)
-	rect := microui.Rect{0, 0, g.window_width, g.window_height}
-	if microui.window(mu_ctx, "Send Files", rect, {.NO_RESIZE, .NO_CLOSE, .NO_TITLE}) {
-		microui.layout_row(mu_ctx, {0, 0, 0})
-		mu_textf(mu_ctx, "Name and Address: Dan <123456>")
-		if .SUBMIT in microui.button(mu_ctx, "Copy Address") {
-			microui.open_popup(mu_ctx, "Edit Your Info")
-		}
-		if .SUBMIT in microui.button(mu_ctx, "Edit") {
-			microui.open_popup(mu_ctx, "Edit Your Info")
-		}
-		if microui.popup(mu_ctx, "Edit Your Info") {
-			//TODO delete
-			@(static) buf: [32]u8
-			@(static) textlen: int
-
-			microui.layout_row(mu_ctx, {0, 0})
-			microui.label(mu_ctx, "Name:")
-			microui.textbox(mu_ctx, buf[:], &textlen)
-			microui.label(mu_ctx, "Address:")
-			if .SUBMIT in microui.button(mu_ctx, "Regenerate Address") {
-			}
-		}
-		if .ACTIVE in microui.treenode(mu_ctx, "Contacts", {.EXPANDED}) {
-			microui.layout_row(mu_ctx, {0, 0})
-			if microui.layout_column(mu_ctx) {
-				microui.button(mu_ctx, "Name ")
-				for contact in g.contacts {
-					mu_textf(mu_ctx, "%v<%v>", contact.name, contact.public_key)
-				}
-			}
-			if microui.layout_column(mu_ctx) {
-				microui.label(mu_ctx, "Actions")
-				microui.layout_row(mu_ctx, {0, 0})
-				for contact in g.contacts {
-					if .SUBMIT in microui.button(mu_ctx, "Send File") {
-
-					}
-					if .SUBMIT in microui.button(mu_ctx, "Delete") {
-
-					}
-				}
-			}
-			microui.layout_row(mu_ctx, {-1})
-			if .SUBMIT in microui.button(mu_ctx, "Add Contact") {
-
-			}
+	im.SetNextWindowPos({0, 0})
+	im.SetNextWindowSize(g.im_io.DisplaySize)
+	im.Begin("Main", nil, {.NoCollapse, .NoResize, .NoTitleBar})
+	// im.SetWindowFontScale(2)
+	{
+		im.BeginChild("Your Contact Info", child_flags = {.Borders, .AutoResizeY})
+		im.SeparatorText("Your Contact Info")
+		im.Text("Dan <123456>")
+		im.SameLine()
+		if im.Button("Copy") {
 
 		}
+		im.SameLine()
+		if im.Button("Edit Name") {
+		}
+		im.EndChild()
 	}
-	microui.end(mu_ctx)
+	{
+		im.BeginChild("Contacts", child_flags = {.Borders, .AutoResizeY})
+		im.SeparatorText("Contacts")
+		if im.BeginTable("Contacts", 4) {
+
+			for contact, i in g.contacts {
+				im.TableNextColumn()
+				im.PushIDInt(auto_cast i)
+				im.Text("%s<%s>", cstr(contact.name), cstr(contact.public_key))
+				im.TableNextColumn()
+				if im.Button("Send File") {
+
+				}
+				im.TableNextColumn()
+				if im.Button("Copy") {
+
+				}
+				im.TableNextColumn()
+				if im.Button("Delete") {
+
+				}
+				im.PopID()
+
+			}
+			im.EndTable()
+		}
+		@(static) filter_text_buffer: [128]u8
+		im.InputText("Filter", cstring(raw_data(&filter_text_buffer)), len(filter_text_buffer))
+		im.SameLine()
+		button_width: f32 = 120.0
+		im.SetCursorPosX(im.GetCursorPosX() + im.GetContentRegionAvail().x - button_width)
+		if im.Button("Add Contact", {button_width, 0}) {
+
+		}
+		im.EndChild()
+	}
+	{
+		human_readable_file_size :: proc(size: int) -> cstring {
+			result: cstring
+			switch size {
+			case 0 ..< 1000:
+				result = fmt.ctprintf("%v bytes", size)
+			case 1000 ..< 1_000_000:
+				result = fmt.ctprintf("%.2f KB", f64(size) / 1000.0)
+			case 1_000_000 ..< 1_000_000_000:
+				result = fmt.ctprintf("%.2f MB", f64(size) / 1_000_000.0)
+			case 1_000_000_000 ..< 1_000_000_000_000:
+				result = fmt.ctprintf("%.2f GB", f64(size) / 1_000_000_000.0)
+			case:
+				result = fmt.ctprintf("%.2f TB", f64(size) / 1_000_000_000_000.0)
+			}
+			return result
+		}
+		im.BeginChild("File Transfers", child_flags = {.Borders, .AutoResizeY})
+		im.SeparatorText("File Transfers")
+		if im.BeginTable("File Transfers", 7) {
+			im.TableSetupColumn("File Name")
+			im.TableSetupColumn("To/From")
+			im.TableSetupColumn("Status")
+			im.TableSetupColumn("Progress")
+			im.TableSetupColumn("Size")
+			im.TableSetupColumn("Rate")
+			im.TableSetupColumn("Actions", {.NoSort})
+			im.TableHeadersRow()
+			for tr, i in g.transfers {
+				im.PushIDInt(auto_cast i)
+
+				im.TableNextColumn()
+				im.Text("%s", cstr(tr.file_name))
+
+				im.TableNextColumn()
+				im.Text("%s<%s>", cstr(tr.counter_party.name), cstr(tr.counter_party.public_key))
+
+				im.TableNextColumn()
+				status_str, _ := fmt.enum_value_to_string(tr.status)
+				im.Text("%s", cstr(status_str))
+
+				im.TableNextColumn()
+				im.Text("%s", human_readable_file_size(0))
+
+				im.TableNextColumn()
+				im.Text("%s", human_readable_file_size(tr.file_size))
+
+				im.TableNextColumn()
+				im.Text("%.2f%", tr.rate / 100)
+
+				im.TableNextColumn()
+				if im.Button("Cancel") {}
+
+
+				im.PopID()
+			}
+
+			im.EndTable()
+		}
+		@(static) filter_text_buffer: [128]u8
+		im.InputText("Filter", cstring(raw_data(&filter_text_buffer)), len(filter_text_buffer))
+		im.EndChild()
+
+	}
+
+
+	im.End()
 
 }
 
@@ -179,7 +298,7 @@ run_ui :: proc() {
 	last_frame: sdl3.Time
 	assert(sdl3.GetCurrentTime(&last_frame))
 	for !g.should_quit {
-		if ENABLE_PROFILING {
+		when ENABLE_PROFILING {
 			spall.SCOPED_EVENT(&g.spall_ctx, tls.spall_buffer, "frame")
 		}
 
@@ -190,99 +309,64 @@ run_ui :: proc() {
 		last_frame = now
 		if is_main_thread() {
 			e: sdl3.Event
+
 			for sdl3.PollEvent(&e) {
+				imgui_impl_sdl3.ProcessEvent(&e)
+
 				#partial switch e.type {
 				case .QUIT:
 					g.should_quit = true
-				case .MOUSE_BUTTON_DOWN:
-					button: Maybe(microui.Mouse)
-
-					switch e.button.button {
-					case sdl3.BUTTON_LEFT:
-						button = .LEFT
-					case sdl3.BUTTON_RIGHT:
-						button = .RIGHT
-					case sdl3.BUTTON_MIDDLE:
-						button = .MIDDLE
-					}
-					switch b in button {
-					case microui.Mouse:
-						microui.input_mouse_down(
-							&g.microui_context,
-							auto_cast e.button.x,
-							auto_cast e.button.y,
-							b,
-						)
-					}
-				case .MOUSE_BUTTON_UP:
-					button: Maybe(microui.Mouse)
-
-					switch e.button.button {
-					case sdl3.BUTTON_LEFT:
-						button = .LEFT
-					case sdl3.BUTTON_RIGHT:
-						button = .RIGHT
-					case sdl3.BUTTON_MIDDLE:
-						button = .MIDDLE
-					}
-					switch b in button {
-					case microui.Mouse:
-						microui.input_mouse_up(
-							&g.microui_context,
-							auto_cast e.button.x,
-							auto_cast e.button.y,
-							b,
-						)
-					}
-				case .MOUSE_MOTION:
-					microui.input_mouse_move(
-						&g.microui_context,
-						auto_cast e.motion.x,
-						auto_cast e.motion.y,
-					)
 				case .WINDOW_RESIZED:
 					g.window_width = e.window.data1
 					g.window_height = e.window.data2
-					init_micro_context(g)
 
 				}
 			}
+			imgui_impl_sdlgpu3.NewFrame()
+			imgui_impl_sdl3.NewFrame()
+			im.NewFrame()
 
-		}
+			build_gui(g)
 
-		build_gui(g)
+			im.Render()
+			draw_data := im.GetDrawData()
+			command_buffer := sdl3.AcquireGPUCommandBuffer(g.gpu_device)
+			swapchain_texture: ^sdl3.GPUTexture
+			swapchain_ok := sdl3.WaitAndAcquireGPUSwapchainTexture(
+				command_buffer,
+				g.window,
+				&swapchain_texture,
+				nil,
+				nil,
+			)
+			assert(swapchain_ok)
 
-		sdl3.RenderClear(g.renderer)
-		cmd: ^microui.Command
-		for microui.next_command(&g.microui_context, &cmd) {
-			switch v in cmd.variant {
-			case ^microui.Command_Text:
-				render_text(v.font, v.str, v.pos.x, v.pos.y, v.color)
-			case ^microui.Command_Clip:
-				mu_rect := v.rect
-				sdl_rect := sdl3.Rect{mu_rect.x, mu_rect.y, mu_rect.w, mu_rect.h}
-				assert(sdl3.SetRenderClipRect(g.renderer, &sdl_rect))
-			case ^microui.Command_Rect:
-				mu_rect := v.rect
-				sdl_rect := sdl3.FRect {
-					auto_cast mu_rect.x,
-					auto_cast mu_rect.y,
-					auto_cast mu_rect.w,
-					auto_cast mu_rect.h,
+			if swapchain_texture != nil {
+				// This is mandatory: call PrepareDrawData() to upload the vertex/index buffer!
+				imgui_impl_sdlgpu3.PrepareDrawData(draw_data, command_buffer)
+
+				color_target_infos := sdl3.GPUColorTargetInfo {
+					texture     = swapchain_texture,
+					clear_color = {0, 0, 0, 1},
+					load_op     = .CLEAR,
+					store_op    = .STORE,
 				}
-				color := v.color
-				sdl3.SetRenderDrawColor(g.renderer, 0, 0, 0, 0)
-				sdl3.RenderRect(g.renderer, &sdl_rect)
-				sdl3.SetRenderDrawColor(g.renderer, color.r, color.g, color.b, color.a)
-				sdl3.RenderFillRect(g.renderer, &sdl_rect)
-			case ^microui.Command_Icon:
-				render_icon(v.id, v.rect, v.color)
-			case ^microui.Command_Jump:
-			//do nothing?
+				render_pass := sdl3.BeginGPURenderPass(command_buffer, &color_target_infos, 1, nil)
+				imgui_impl_sdlgpu3.RenderDrawData(draw_data, command_buffer, render_pass)
+
+				sdl3.EndGPURenderPass(render_pass)
 			}
+
+			when ENABLE_DOCKING {
+				im.UpdatePlatformWindows()
+				im.RenderPlatformWindowsDefault()
+			}
+
+			assert(sdl3.SubmitGPUCommandBuffer(command_buffer))
+
 		}
 
-		sdl3.RenderPresent(g.renderer)
+
 	}
 }
 
@@ -311,110 +395,6 @@ lane_range :: proc(count: int) -> (start: int, end: int) {
 	end = start + values_per_thread + (1 if thread_has_leftover else 0)
 	return
 }
-init_micro_context :: proc(g: ^G) {
-	microui.init(&g.microui_context)
-
-	g.microui_context.text_height = proc(font: microui.Font) -> i32 {
-		return microui.default_atlas_text_height(font) * FONT_MULTIPLIER
-	}
-
-	g.microui_context.text_width = proc(font: microui.Font, text: string) -> i32 {
-		return microui.default_atlas_text_width(font, text) * FONT_MULTIPLIER
-	}
-	//needed to have longer text on the same line
-	g.microui_context.style.size[0] = 200
-
-}
-
-init_microui_atlas :: proc() {
-	g := tls.g
-	// microui's atlas is a 128x128 single-channel (alpha) image.
-	// Expand it to RGBA so SDL can use it: white RGB, atlas value as alpha.
-	pixels := make(
-		[]u32,
-		microui.DEFAULT_ATLAS_WIDTH * microui.DEFAULT_ATLAS_HEIGHT,
-		context.temp_allocator,
-	)
-
-	for val, i in microui.default_atlas_alpha {
-		pixels[i] = 0x00FFFFFF | (u32(val) << 24) // ABGR: alpha from atlas, white RGB
-	}
-
-	g.atlas_texture = sdl3.CreateTexture(
-		g.renderer,
-		.ABGR8888,
-		.STATIC,
-		microui.DEFAULT_ATLAS_WIDTH,
-		microui.DEFAULT_ATLAS_HEIGHT,
-	)
-	assert(g.atlas_texture != nil)
-
-	sdl3.UpdateTexture(
-		g.atlas_texture,
-		nil,
-		raw_data(pixels),
-		microui.DEFAULT_ATLAS_WIDTH * size_of(u32),
-	)
-	sdl3.SetTextureBlendMode(g.atlas_texture, {.BLEND})
-	sdl3.SetTextureScaleMode(g.atlas_texture, .NEAREST)
-}
-render_text :: proc(font: microui.Font, text: string, x, y: i32, color: microui.Color) {
-	g := tls.g
-	sdl3.SetTextureColorMod(g.atlas_texture, color.r, color.g, color.b)
-	sdl3.SetTextureAlphaMod(g.atlas_texture, color.a)
-
-	dst_x := f32(x)
-	dst_y := f32(y)
-
-	for ch in text {
-		// Clamp to the atlas range; microui's default atlas covers glyphs 32–127
-		glyph := int(ch)
-		if glyph < 32 || glyph > 127 do glyph = 127
-
-		atlas_rect := microui.default_atlas[microui.DEFAULT_ATLAS_FONT + glyph]
-
-		src := sdl3.FRect {
-			x = f32(atlas_rect.x),
-			y = f32(atlas_rect.y),
-			w = f32(atlas_rect.w),
-			h = f32(atlas_rect.h),
-		}
-		dst := sdl3.FRect {
-			x = dst_x,
-			y = dst_y,
-			w = src.w * FONT_MULTIPLIER,
-			h = src.h * FONT_MULTIPLIER,
-		}
-
-		sdl3.RenderTexture(g.renderer, g.atlas_texture, &src, &dst)
-		dst_x += dst.w
-	}
-}
-render_icon :: proc(id: microui.Icon, rect: microui.Rect, color: microui.Color) {
-	g := tls.g
-	atlas_rect := microui.default_atlas[int(id)]
-
-	// Center the icon glyph within the destination rect
-	dst_x := f32(rect.x) + f32(rect.w - atlas_rect.w) / 2
-	dst_y := f32(rect.y) + f32(rect.h - atlas_rect.h) / 2
-
-	src := sdl3.FRect {
-		x = f32(atlas_rect.x),
-		y = f32(atlas_rect.y),
-		w = f32(atlas_rect.w),
-		h = f32(atlas_rect.h),
-	}
-	dst := sdl3.FRect {
-		x = dst_x,
-		y = dst_y,
-		w = src.w,
-		h = src.h,
-	}
-
-	sdl3.SetTextureColorMod(g.atlas_texture, color.r, color.g, color.b)
-	sdl3.SetTextureAlphaMod(g.atlas_texture, color.a)
-	sdl3.RenderTexture(g.renderer, g.atlas_texture, &src, &dst)
-}
 
 
 // Automatic profiling of every procedure:
@@ -425,7 +405,7 @@ spall_enter :: proc "contextless" (
 	loc: runtime.Source_Code_Location,
 ) {
 
-	if ENABLE_PROFILING {
+	when ENABLE_PROFILING {
 		g := tls.g
 		if g != nil {
 			spall._buffer_begin(&g.spall_ctx, tls.spall_buffer, "", "", loc)
@@ -438,7 +418,7 @@ spall_exit :: proc "contextless" (
 	proc_address, call_site_return_address: rawptr,
 	loc: runtime.Source_Code_Location,
 ) {
-	if ENABLE_PROFILING {
+	when ENABLE_PROFILING {
 		g := tls.g
 		if g != nil {
 			spall._buffer_end(&g.spall_ctx, tls.spall_buffer)
@@ -450,27 +430,45 @@ spall_exit :: proc "contextless" (
 tls: TLS
 
 G :: struct {
-	should_quit:     bool,
-	spall_ctx:       spall.Context,
-	window_width:    i32,
-	window_height:   i32,
+	should_quit:   bool,
+	spall_ctx:     spall.Context,
+	window_width:  i32,
+	window_height: i32,
 
 
 	//UI
-	microui_context: microui.Context,
+	im_io:         ^im.IO,
 
 	//Persistent State
-	contacts:        [dynamic]Contact,
+	contacts:      [dynamic]Contact,
+	transfers:     [dynamic]Transfer,
 
 
 	//platform specific
-	window:          ^sdl3.Window,
-	atlas_texture:   ^sdl3.Texture,
-	renderer:        ^sdl3.Renderer,
+	window:        ^sdl3.Window,
+	atlas_texture: ^sdl3.Texture,
+	gpu_device:    ^sdl3.GPUDevice,
 }
 Contact :: struct {
 	name:       string,
 	public_key: string, //TODO: make real public key
+}
+Transfer :: struct {
+	file_name:                    string,
+	file_size:                    int,
+	counter_party:                Contact,
+	status:                       TransferStatus,
+	file_slices_to_be_transfered: [dynamic]FileSlice,
+	rate:                         f64,
+}
+FileSlice :: struct {
+	offset: int,
+	len:    int,
+}
+TransferStatus :: enum {
+	NotStarted,
+	//...
+	Transferring,
 }
 TLS :: struct {
 	g:            ^G,
