@@ -5,9 +5,17 @@ import im "3rdparty/imgui"
 import "3rdparty/imgui/imgui_impl_sdl3"
 import "3rdparty/imgui/imgui_impl_sdlgpu3"
 import "base:runtime"
+import "core:bytes"
 import "core:crypto"
+import "core:crypto/aead"
+import "core:crypto/chacha20poly1305"
+import "core:crypto/hkdf"
+import "core:crypto/sha2"
+import "core:crypto/x25519"
 import "core:fmt"
+import "core:log"
 import "core:math/rand"
+import "core:mem"
 import "core:nbio"
 import "core:os"
 import "core:prof/spall"
@@ -24,6 +32,8 @@ ENABLE_PROFILING :: false
 ENABLE_DOCKING :: false
 
 main :: proc() {
+	context.logger = log.create_console_logger()
+
 	lane_count := os.get_processor_core_count()
 	g := new(G)
 	bootstrap_barrier: sync.Barrier
@@ -42,8 +52,7 @@ main :: proc() {
 	threads := make([]^thread.Thread, lane_count - 1)
 	spall_buffers := make([]^spall.Buffer, lane_count - 1)
 	for i in 1 ..< lane_count {
-		temp_tls.lane_id = i
-		temp_tls.g = g
+		lane_ctx := LaneContext{i, lane_count, &bootstrap_barrier}
 
 		when ENABLE_PROFILING {
 			buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
@@ -53,11 +62,15 @@ main :: proc() {
 
 			spall_buffers[i - 1] = temp_tls.spall_buffer
 		}
-		threads[i - 1] = thread.create_and_start_with_poly_data(temp_tls, multithread_entry_point)
+		threads[i - 1] = thread.create_and_start_with_poly_data3(
+			g,
+			lane_ctx,
+			spall_buffers[i - 1],
+			multithread_entry_point,
+			init_context = context,
+		)
 	}
 
-
-	temp_tls.lane_id = 0 //lane id 0 is always main thread
 
 	when ENABLE_PROFILING {
 		buffer_backing := make([]u8, spall.BUFFER_DEFAULT_SIZE)
@@ -65,7 +78,8 @@ main :: proc() {
 		temp_tls.spall_buffer^ = spall.buffer_create(buffer_backing, 0)
 	}
 
-	multithread_entry_point(temp_tls)
+	lane_ctx := LaneContext{0, lane_count, &bootstrap_barrier}
+	multithread_entry_point(g, lane_ctx, spall_buffers[0])
 
 	thread.join_multiple(..threads)
 	when ENABLE_PROFILING {
@@ -79,11 +93,16 @@ main :: proc() {
 	}
 }
 
-multithread_entry_point :: proc(tls_context: TLS) {
+multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spall.Buffer) {
 
-	tls = tls_context
-	g := tls.g
+	tls.lane_ctx = lane_ctx
+	tls.spall_ctx = spall_buffer
+	tls.g = g
 
+	if true {
+		run_tests()
+		return
+	}
 
 	if is_main_thread() {
 		im.CHECKVERSION()
@@ -126,6 +145,7 @@ multithread_entry_point :: proc(tls_context: TLS) {
 
 
 		//init placeholder values.  TODO: remove
+		g.my_name = "Dan"
 		append(&g.contacts, Contact{"Alice", "98765"})
 		append(&g.contacts, Contact{"Bob", "654321"})
 
@@ -175,7 +195,7 @@ build_gui :: proc(g: ^G) {
 	{
 		im.BeginChild("Your Contact Info", child_flags = {.Borders, .AutoResizeY})
 		im.SeparatorText("Your Contact Info")
-		im.Text("Dan <123456>")
+		im.Text("%s", cstr(g.my_name))
 		im.SameLine()
 		if im.Button("Copy") {
 
@@ -285,6 +305,27 @@ build_gui :: proc(g: ^G) {
 		im.EndChild()
 
 	}
+	//TODO enable once we have persistence
+	if false && len(g.my_name) == 0 {
+		if im.BeginPopupModal("Enter your name") {
+			@(static) inputted_name: [MAX_NAME_SIZE]u8
+			im.Text("Please enter the name you want your contacts to know you by:")
+			submit := im.InputText(
+				"Name",
+				cstring(raw_data(&inputted_name)),
+				len(inputted_name),
+				{.EnterReturnsTrue},
+			)
+			if submit || im.Button("OK") {
+				//TODO check and save name
+
+			}
+			im.EndPopup()
+
+		}
+		im.OpenPopup("Enter your name")
+
+	}
 
 
 	im.End()
@@ -382,9 +423,9 @@ lane_count :: proc() -> int {
 lane_sync :: proc() {
 	sync.barrier_wait(tls.barrier)
 }
-lane_range :: proc(count: int) -> (start: int, end: int) {
-	lane_count := lane_count()
-	lane_id := lane_id()
+lane_range :: proc(count: $T) -> (start: T, end: T) {
+	lane_count: T = auto_cast lane_count()
+	lane_id: T = auto_cast lane_id()
 
 	values_per_thread := count / lane_count
 	leftover_values_count := count % lane_count
@@ -396,6 +437,23 @@ lane_range :: proc(count: int) -> (start: int, end: int) {
 	return
 }
 
+@(deferred_none = lane_pop_ctx)
+lane_push_ctx :: proc(new_lane_count: int, new_lane_id: int, barrier: ^sync.Barrier) -> bool {
+	// fmt.printf("lane_push_ctx: %v\n", lane_id())
+	append(&tls.lane_contexts, tls.lane_ctx)
+
+	tls.lane_count = new_lane_count
+	tls.lane_id = new_lane_id
+	tls.barrier = barrier
+
+	return new_lane_id < new_lane_count
+}
+lane_pop_ctx :: proc() {
+	// fmt.printf("lane_pop_ctx: %v\n", lane_id())
+	tls.lane_ctx = pop(&tls.lane_contexts)
+}
+
+//TODO push lane context
 
 // Automatic profiling of every procedure:
 
@@ -430,25 +488,34 @@ spall_exit :: proc "contextless" (
 tls: TLS
 
 G :: struct {
-	should_quit:   bool,
-	spall_ctx:     spall.Context,
-	window_width:  i32,
-	window_height: i32,
+	should_quit:       bool,
+	spall_ctx:         spall.Context,
+	window_width:      i32,
+	window_height:     i32,
 
 
 	//UI
-	im_io:         ^im.IO,
+	im_io:             ^im.IO,
 
 	//Persistent State
-	contacts:      [dynamic]Contact,
-	transfers:     [dynamic]Transfer,
+	contacts:          [dynamic]Contact,
+	transfers:         [dynamic]Transfer,
+	my_name:           string,
+	master_secret_key: SecretKey,
 
 
 	//platform specific
-	window:        ^sdl3.Window,
-	atlas_texture: ^sdl3.Texture,
-	gpu_device:    ^sdl3.GPUDevice,
+	window:            ^sdl3.Window,
+	atlas_texture:     ^sdl3.Texture,
+	gpu_device:        ^sdl3.GPUDevice,
 }
+
+//File Transfer related
+MAX_NAME_SIZE :: 128
+MAX_FILE_NAME_SIZE :: 512
+
+PublicKey :: distinct [x25519.POINT_SIZE]byte
+SecretKey :: distinct [x25519.SCALAR_SIZE]byte
 Contact :: struct {
 	name:       string,
 	public_key: string, //TODO: make real public key
@@ -470,10 +537,212 @@ TransferStatus :: enum {
 	//...
 	Transferring,
 }
+
+//Send Files Protocol (SFP) stuff
+SFP_VERSION :: i32(0)
+SFPPacketHeader :: struct #packed {
+	version:          i32,
+	op:               SFPOp,
+	session_id:       PublicKey,
+	encryption_tag:   [chacha20poly1305.TAG_SIZE]byte,
+	encryption_nonce: [chacha20poly1305.XIV_SIZE]byte,
+}
+
+SFPAddress :: struct #packed {
+	label:      [16]byte, //This is used by the recipient to derive the secret key from their master secret key
+	public_key: PublicKey,
+}
+
+create_sfp_address :: proc(
+	master_secret_key: SecretKey,
+) -> (
+	address: SFPAddress,
+	secret_key: SecretKey,
+) {
+	master_secret_key := master_secret_key
+
+	crypto.rand_bytes(address.label[:])
+
+	sha_ctx: sha2.Context_256
+	sha2.init_256(&sha_ctx)
+	sha2.update(&sha_ctx, master_secret_key[:])
+	sha2.update(&sha_ctx, address.label[:])
+	sha2.final(&sha_ctx, secret_key[:])
+
+	x25519.scalarmult_basepoint(address.public_key[:], secret_key[:])
+
+	return
+}
+derive_secret_key_from_sfp_address :: proc(
+	address: SFPAddress,
+	master_secret_key: SecretKey,
+) -> SecretKey {
+	result: SecretKey
+
+	master_secret_key := master_secret_key
+	address := address
+
+	sha_ctx: sha2.Context_256
+	sha2.init_256(&sha_ctx)
+	sha2.update(&sha_ctx, master_secret_key[:])
+	sha2.update(&sha_ctx, address.label[:])
+	sha2.final(&sha_ctx, result[:])
+
+	return result
+}
+
+SFPFileSendRequest :: struct #packed {
+	using header:      SFPPacketHeader,
+	target_address:    SFPAddress,
+	encrypted_payload: [size_of(SFPFileSendRequestPayload)]byte,
+}
+SFPFileSendRequestPayload :: struct #packed {
+	reply_ip_address: nbio.IP4_Address,
+	reply_port:       u16,
+	file_size:        i64,
+	file_name:        [dynamic; MAX_FILE_NAME_SIZE]byte,
+	requester_name:   [dynamic; MAX_NAME_SIZE]byte,
+}
+
+
+#assert(
+	size_of(SFPFileSendRequest) == 4 + 4 + 32 + 32 + 16 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 128,
+)
+
+init_sfp_file_send_request :: proc(
+	ephemeral_secret_key: SecretKey,
+	target_address: SFPAddress,
+	file_size: i64,
+	file_name: string,
+	requester_name: string,
+	reply_ip_address: nbio.IP4_Address,
+	reply_port: u16,
+	out_packet: ^SFPFileSendRequest,
+) {
+	out_packet.version = SFP_VERSION
+	out_packet.op = .FileSendRequest
+
+	//set up payload to be encrypted
+	payload: SFPFileSendRequestPayload
+	{
+		payload.file_size = file_size
+		resize(&payload.file_name, len(file_name))
+		copy(payload.file_name[:], file_name[:])
+		resize(&payload.requester_name, len(requester_name))
+		copy(payload.requester_name[:], requester_name[:])
+		payload.reply_ip_address = reply_ip_address
+		payload.reply_port = reply_port
+	}
+
+
+	//calculate the encryption key
+	encryption_key: SecretKey
+	{
+		ephemeral_secret_key := ephemeral_secret_key
+		x25519.scalarmult_basepoint(out_packet.session_id[:], ephemeral_secret_key[:])
+
+		out_packet.target_address = target_address
+
+		x25519.scalarmult(
+			encryption_key[:],
+			ephemeral_secret_key[:],
+			out_packet.target_address.public_key[:],
+		)
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+
+	crypto.rand_bytes(out_packet.encryption_nonce[:])
+
+	payload_bytes := mem.byte_slice(&payload, size_of(payload))
+
+	aead.seal_oneshot(
+		.XCHACHA20POLY1305,
+		payload_bytes,
+		out_packet.encryption_tag[:],
+		encryption_key[:],
+		out_packet.encryption_nonce[:],
+		nil,
+		payload_bytes,
+	)
+	copy(out_packet.encrypted_payload[:], payload_bytes[:])
+}
+parse_sfp_file_send_request :: proc(
+	target_secret_key: SecretKey,
+	out_payload: ^SFPFileSendRequestPayload,
+	in_packet: ^SFPFileSendRequest,
+) -> bool {
+	//calculate the encryption key
+	encryption_key: SecretKey
+	{
+		target_secret_key := target_secret_key
+
+		x25519.scalarmult(encryption_key[:], target_secret_key[:], in_packet.session_id[:])
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+
+	garbage := [24]byte{}
+	decrypted := aead.open_oneshot(
+		.XCHACHA20POLY1305,
+		in_packet.encrypted_payload[:],
+		encryption_key[:],
+		in_packet.encryption_nonce[:],
+		nil,
+		in_packet.encrypted_payload[:],
+		in_packet.encryption_tag[:],
+	)
+	if !decrypted {
+		return false
+	}
+
+	decrypted_payload := transmute(^SFPFileSendRequestPayload)&in_packet.encrypted_payload
+	out_payload^ = decrypted_payload^
+
+	return true
+
+}
+
+
+SFP_MAX_DATA_CHUNK_SIZE :: 16 * 1024
+
+SFPFileDataPacket :: struct #packed {
+	using header: SFPPacketHeader,
+	payload:      [size_of(SFPFileDataPayload)]byte,
+}
+#assert(size_of(SFPFileDataPacket) == 4 + 4 + 32 + 24 + 16 + 8 + 8 + 16 * 1024)
+
+SFPFileDataPayload :: struct #packed {
+	file_offset:     i64,
+	file_data_chunk: [dynamic; SFP_MAX_DATA_CHUNK_SIZE]byte,
+}
+
+init_sfp_file_data_packet :: proc(offset: i64, data: []byte, out_packet: ^SFPFileDataPacket) {
+}
+
+SFPOp :: enum (i32) {
+	None = 0,
+	FileSendRequest,
+	AcceptFileSendRequest,
+	FileData,
+	ResendFileData,
+}
+
+//Application specific
 TLS :: struct {
-	g:            ^G,
-	lane_id:      int,
-	lane_count:   int,
-	barrier:      ^sync.Barrier,
-	spall_buffer: ^spall.Buffer,
+	g:              ^G,
+	spall_ctx:      ^spall.Buffer,
+	using lane_ctx: LaneContext,
+	lane_contexts:  [dynamic; 64]LaneContext,
+}
+LaneContext :: struct {
+	lane_id:    int,
+	lane_count: int,
+	barrier:    ^sync.Barrier,
 }
