@@ -5,15 +5,23 @@ import "core:crypto/sha2"
 import "core:crypto/x25519"
 import "core:fmt"
 import "core:log"
+import "core:mem"
 import "core:nbio"
+import "core:net"
 import "core:sync"
 run_tests :: proc() {
 	g := tls.g
 
 	test_constructing_parsing_file_send_request_packet()
+	test_sending_file_send_request()
 	// test_send_ping_pong()
 	// test_file_transfer()
 	lane_sync()
+	if is_main_thread() {
+		fmt.printfln("All tests passed!")
+	}
+
+
 }
 
 test_constructing_parsing_file_send_request_packet :: proc() {
@@ -30,22 +38,131 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 
 		packet: SFPFileSendRequest
 
+		FILE_NAME :: "hello.mp4"
+		FILE_SIZE :: 1234
+		REQUESTER_NAME :: "Dan"
+		IP_ADDR :: nbio.IP4_Address{127, 0, 0, 1}
+		PORT :: 12345
+
 		init_sfp_file_send_request(
 			sender_ephemeral_secret_key,
 			target_address,
-			1234,
-			"hello.mp4",
-			"Dan",
-			{127, 0, 0, 1},
-			12345,
+			FILE_SIZE,
+			FILE_NAME,
+			REQUESTER_NAME,
+			IP_ADDR,
+			PORT,
 			&packet,
 		)
 		payload: SFPFileSendRequestPayload
-		ok := parse_sfp_file_send_request(target_secret_key, &payload, &packet)
+		ok := parse_sfp_file_send_request(target_master_secret_key, &payload, &packet)
 		ensure(ok)
-		// logf("%v", payload)
+		ensure(string(payload.file_name[:]) == FILE_NAME)
+		ensure(payload.file_size == FILE_SIZE)
+		ensure(string(payload.requester_name[:]) == REQUESTER_NAME)
+		ensure(payload.reply_ip_address == IP_ADDR)
+		ensure(payload.reply_port == PORT)
+
 	}
 
+}
+test_sending_file_send_request :: proc() {
+	FILE_NAME :: "hello.mp4"
+	FILE_SIZE :: 1234
+	REQUESTER_NAME :: "Dan"
+	IP_ADDR :: nbio.IP4_Address{127, 0, 0, 1}
+	PORT :: 12345
+	DISCOVER_NODE_PORT :: 54321
+	RECEIVER_CLIENT_PORT :: 65432
+
+	@(static) receiver_master_sk: SecretKey
+	@(static) receiver_address: SFPAddress
+	@(static) receiver_address_sk: SecretKey
+	if is_main_thread() {
+		_, receiver_master_sk = create_key_pair()
+		receiver_address, receiver_address_sk = create_sfp_address(receiver_master_sk)
+	}
+	lane_sync()
+
+
+	if is_main_thread() {
+		nbio.acquire_thread_event_loop()
+		defer nbio.release_thread_event_loop()
+		ephemeral_pk, ephemperal_sk := create_key_pair()
+		file_send_request_packet: SFPFileSendRequest
+		init_sfp_file_send_request(
+			ephemperal_sk,
+			receiver_address,
+			FILE_SIZE,
+			FILE_NAME,
+			REQUESTER_NAME,
+			IP_ADDR,
+			PORT,
+			&file_send_request_packet,
+		)
+		socket, socket_err := nbio.create_udp_socket(.IP4)
+		ensure(socket_err == .None)
+		defer nbio.close(socket)
+		nbio.send(
+			socket,
+			{mem.byte_slice(&file_send_request_packet, size_of(file_send_request_packet))},
+			proc(op: ^nbio.Operation) {
+				err := op.recv.err
+				if err != nil {
+					log.errorf("Sending file send request failed %v", err)
+					ensure(false)
+				}
+			},
+			{nbio.IP4_Loopback, RECEIVER_CLIENT_PORT},
+		)
+		err := nbio.run()
+		ensure(err == .None)
+
+
+	} else if is_io_thread() {
+		nbio.acquire_thread_event_loop()
+		defer nbio.release_thread_event_loop()
+
+		socket, socket_err := nbio.create_udp_socket(.IP4)
+		ensure(socket_err == .None)
+		bind_err := nbio.bind(socket, {nbio.IP4_Loopback, RECEIVER_CLIENT_PORT})
+		ensure(bind_err == .None)
+		defer nbio.close(socket)
+
+		file_send_request: SFPFileSendRequest
+		nbio.recv(
+			socket,
+			{mem.byte_slice(&file_send_request, size_of(file_send_request))},
+			proc(op: ^nbio.Operation) {
+				err := op.recv.err
+				if err == nil {
+					incoming_packet := cast(^SFPFileSendRequest)raw_data(op.recv.bufs[0])
+					payload: SFPFileSendRequestPayload
+
+					success := parse_sfp_file_send_request(
+						receiver_master_sk,
+						&payload,
+						incoming_packet,
+					)
+					ensure(success)
+					ensure(string(payload.file_name[:]) == FILE_NAME)
+					ensure(payload.file_size == FILE_SIZE)
+					ensure(string(payload.requester_name[:]) == REQUESTER_NAME)
+					ensure(payload.reply_ip_address == IP_ADDR)
+					ensure(payload.reply_port == PORT)
+
+				} else {
+					log.errorf("Receiving file send request failed %v", err)
+					ensure(false)
+				}
+			},
+			true,
+		)
+		err := nbio.run()
+		ensure(err == .None)
+
+	}
+	lane_sync()
 }
 
 

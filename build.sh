@@ -4,8 +4,11 @@ set -e
 BUILD_DIR=build
 NAME=sendfiles
 
+export ODIN_CLANG_PATH=/opt/homebrew/Cellar/llvm/22.1.3/bin/clang
 compile() {
-    odin build . -debug -out:$BUILD_DIR/$NAME
+    odin build . -o:none -debug -sanitize:address -out:$BUILD_DIR/$NAME
+    # odin build . -o:none -debug  -out:$BUILD_DIR/$NAME
+    # odin build . -o:speed -out:$BUILD_DIR/$NAME
 }
 
 if [[ ! -d $BUILD_DIR ]]; then
