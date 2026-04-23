@@ -1,0 +1,332 @@
+package sfp
+import "core:crypto"
+import "core:crypto/aead"
+import "core:crypto/chacha20poly1305"
+import "core:crypto/sha2"
+import "core:crypto/x25519"
+import "core:mem"
+import "core:nbio"
+VERSION :: i32(0)
+MAX_NAME_SIZE :: 64
+MAX_FILE_NAME_SIZE :: 512
+
+DiscoveryServerHeader :: struct #packed {
+	version: i32,
+	magic:   u32,
+}
+
+PING_MAGIC :: 0x676E6970 //ASCII for "ping"
+
+Ping :: struct #packed {
+	using header: DiscoveryServerHeader,
+}
+PONG_MAGIC :: 0x676E6F70 //ASCII for "pong"
+Pong :: struct #packed {
+	using header:  DiscoveryServerHeader,
+	external_ip:   nbio.IP4_Address,
+	external_port: u16,
+}
+
+RENDEZVOUS_MAGIC :: 0x646E6572 //ASCII for "rend"
+Rendezvous :: struct #packed {
+	version:           i32,
+	magic:             u32,
+	target_ip_address: nbio.IP4_Address,
+	target_port:       u16,
+	reply_ip_address:  nbio.IP4_Address,
+	reply_port:        u16,
+	session_id:        PublicKey,
+}
+
+
+//unencrypted header containing only necessary information needed for decryption
+PacketHeader :: struct #packed {
+	version:          i32,
+	session_id:       PublicKey,
+	encryption_tag:   [chacha20poly1305.TAG_SIZE]byte,
+	encryption_nonce: [chacha20poly1305.XIV_SIZE]byte,
+}
+//All encrypted payloads must start with this header
+PacketPayloadHeader :: struct #packed {
+	op: Op,
+}
+PublicKey :: distinct [x25519.POINT_SIZE]byte
+SecretKey :: distinct [x25519.SCALAR_SIZE]byte
+
+Address :: struct #packed {
+	label:      [16]byte, //This is used by the recipient to derive the secret key from their master secret key
+	public_key: PublicKey,
+}
+
+create_key_pair :: proc() -> (pk: PublicKey, sk: SecretKey) {
+	crypto.rand_bytes(sk[:])
+	x25519.scalarmult_basepoint(pk[:], sk[:])
+	return
+}
+
+create_sfp_address :: proc(
+	master_secret_key: SecretKey,
+) -> (
+	address: Address,
+	secret_key: SecretKey,
+) {
+	master_secret_key := master_secret_key
+
+	crypto.rand_bytes(address.label[:])
+
+	sha_ctx: sha2.Context_256
+	sha2.init_256(&sha_ctx)
+	sha2.update(&sha_ctx, master_secret_key[:])
+	sha2.update(&sha_ctx, address.label[:])
+	sha2.final(&sha_ctx, secret_key[:])
+
+	x25519.scalarmult_basepoint(address.public_key[:], secret_key[:])
+
+	return
+}
+derive_and_validate_secret_key_from_sfp_address :: proc(
+	address: Address,
+	master_secret_key: SecretKey,
+) -> (
+	SecretKey,
+	bool,
+) {
+	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
+	pk: PublicKey
+	x25519.scalarmult_basepoint(pk[:], sk[:])
+	if pk != address.public_key {
+		return {}, false
+	}
+	return sk, true
+}
+derive_secret_key_from_sfp_address :: proc(
+	address: Address,
+	master_secret_key: SecretKey,
+) -> SecretKey {
+	result: SecretKey
+
+	master_secret_key := master_secret_key
+	address := address
+
+	sha_ctx: sha2.Context_256
+	sha2.init_256(&sha_ctx)
+	sha2.update(&sha_ctx, master_secret_key[:])
+	sha2.update(&sha_ctx, address.label[:])
+	sha2.final(&sha_ctx, result[:])
+
+	return result
+}
+
+validate_sfp_address_is_mine :: proc(address: Address, master_secret_key: SecretKey) -> bool {
+	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
+	pk: PublicKey
+	x25519.scalarmult_basepoint(pk[:], sk[:])
+	if pk != address.public_key {
+		return false
+	}
+	return true
+}
+
+FileSendRequest :: struct #packed {
+	using header:      PacketHeader,
+	target_address:    Address,
+	encrypted_payload: [size_of(FileSendRequestPayload)]byte,
+}
+FileSendRequestPayload :: struct #packed {
+	using header:     PacketPayloadHeader,
+	reply_ip_address: nbio.IP4_Address,
+	reply_port:       u16,
+	file_size:        i64,
+	file_name:        [dynamic; MAX_FILE_NAME_SIZE]byte,
+	requester_name:   [dynamic; MAX_NAME_SIZE]byte,
+}
+
+
+#assert(size_of(FileSendRequest) == 4 + 4 + 32 + 32 + 16 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 64)
+
+init_sfp_file_send_request :: proc(
+	ephemeral_secret_key: SecretKey,
+	target_address: Address,
+	file_size: i64,
+	file_name: string,
+	requester_name: string,
+	reply_ip_address: nbio.IP4_Address,
+	reply_port: u16,
+	out_packet: ^FileSendRequest,
+) {
+	out_packet.version = VERSION
+
+	//set up payload to be encrypted
+	payload: FileSendRequestPayload
+	{
+		payload.op = .FileSendRequest
+		payload.file_size = file_size
+		resize(&payload.file_name, len(file_name))
+		copy(payload.file_name[:], file_name[:])
+		resize(&payload.requester_name, len(requester_name))
+		copy(payload.requester_name[:], requester_name[:])
+		payload.reply_ip_address = reply_ip_address
+		payload.reply_port = reply_port
+	}
+
+
+	//calculate the encryption key
+	encryption_key: SecretKey
+	{
+		ephemeral_secret_key := ephemeral_secret_key
+		x25519.scalarmult_basepoint(out_packet.session_id[:], ephemeral_secret_key[:])
+
+		out_packet.target_address = target_address
+
+		x25519.scalarmult(
+			encryption_key[:],
+			ephemeral_secret_key[:],
+			out_packet.target_address.public_key[:],
+		)
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+
+	crypto.rand_bytes(out_packet.encryption_nonce[:])
+
+	payload_bytes := mem.byte_slice(&payload, size_of(payload))
+
+	aead.seal_oneshot(
+		.XCHACHA20POLY1305,
+		payload_bytes,
+		out_packet.encryption_tag[:],
+		encryption_key[:],
+		out_packet.encryption_nonce[:],
+		nil,
+		payload_bytes,
+	)
+	copy(out_packet.encrypted_payload[:], payload_bytes[:])
+}
+parse_sfp_file_send_request :: proc(
+	master_secret_key: SecretKey,
+	out_payload: ^FileSendRequestPayload,
+	in_packet: ^FileSendRequest,
+) -> bool {
+	//calculate the encryption key
+	encryption_key: SecretKey
+	{
+		target_secret_key, valid := derive_and_validate_secret_key_from_sfp_address(
+			in_packet.target_address,
+			master_secret_key,
+		)
+		if !valid {
+			return false
+		}
+
+		x25519.scalarmult(encryption_key[:], target_secret_key[:], in_packet.session_id[:])
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+
+	garbage := [24]byte{}
+	decrypted := aead.open_oneshot(
+		.XCHACHA20POLY1305,
+		in_packet.encrypted_payload[:],
+		encryption_key[:],
+		in_packet.encryption_nonce[:],
+		nil,
+		in_packet.encrypted_payload[:],
+		in_packet.encryption_tag[:],
+	)
+	if !decrypted {
+		return false
+	}
+
+	decrypted_payload := transmute(^FileSendRequestPayload)&in_packet.encrypted_payload
+	out_payload^ = decrypted_payload^
+
+	return true
+
+}
+
+FileSendRequestAccept :: struct #packed {
+	using header:      PacketHeader,
+	encrypted_payload: [size_of(FileSendRequestAcceptPayload)]byte,
+}
+FileSendRequestAcceptPayload :: struct #packed {
+	using header:     PacketPayloadHeader,
+	receiver_address: Address, //used for validation purposes
+}
+init_sfp_file_send_request_accept :: proc(
+	receiver_master_secret_key: SecretKey,
+	receiver_address: Address,
+	session_id: PublicKey,
+	out_packet: ^FileSendRequestAccept,
+) {
+	out_packet.version = VERSION
+
+	//set up payload to be encrypted
+	payload: FileSendRequestAcceptPayload
+	{
+		payload.op = .AcceptFileSendRequest
+		payload.receiver_address = receiver_address
+	}
+
+
+	//calculate the encryption key
+	encryption_key: SecretKey
+	{
+		sk := derive_secret_key_from_sfp_address(receiver_address, receiver_master_secret_key)
+		x25519.scalarmult_basepoint(out_packet.session_id[:], sk[:])
+
+
+		session_id := session_id
+		x25519.scalarmult(encryption_key[:], sk[:], session_id[:])
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+
+	crypto.rand_bytes(out_packet.encryption_nonce[:])
+
+	payload_bytes := mem.byte_slice(&payload, size_of(payload))
+
+	aead.seal_oneshot(
+		.XCHACHA20POLY1305,
+		payload_bytes,
+		out_packet.encryption_tag[:],
+		encryption_key[:],
+		out_packet.encryption_nonce[:],
+		nil,
+		payload_bytes,
+	)
+	copy(out_packet.encrypted_payload[:], payload_bytes[:])
+}
+
+
+_MAX_DATA_CHUNK_SIZE :: 16 * 1024
+
+FileDataPacket :: struct #packed {
+	using header: PacketHeader,
+	payload:      [size_of(FileDataPayload)]byte,
+}
+// #assert(size_of(FileDataPacket) == 4 + 4 + 32 + 24 + 16 + 8 + 8 + 16 * 1024)
+
+FileDataPayload :: struct #packed {
+	file_offset:     i64,
+	file_data_chunk: [dynamic; _MAX_DATA_CHUNK_SIZE]byte,
+}
+
+init_sfp_file_data_packet :: proc(offset: i64, data: []byte, out_packet: ^FileDataPacket) {
+}
+
+Op :: enum (i32) {
+	None = 0,
+	FileSendRequest,
+	AcceptFileSendRequest,
+	FileData,
+	ResendFileData,
+}

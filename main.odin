@@ -8,6 +8,8 @@ import "3rdparty/imgui/imgui_impl_sdl3"
 import "3rdparty/imgui/imgui_impl_sdlgpu3"
 import "base:runtime"
 import "core:bytes"
+import "core:c"
+import "core:container/queue"
 import "core:crypto"
 import "core:crypto/aead"
 import "core:crypto/chacha20poly1305"
@@ -21,13 +23,18 @@ import "core:log"
 import "core:math/rand"
 import "core:mem"
 import "core:nbio"
+import "core:net"
 import "core:os"
+import "core:path/filepath"
 import "core:prof/spall"
 import "core:strings"
 import "core:sync"
+import "core:sync/chan"
+import "core:sys/darwin/Foundation"
+import "core:sys/posix"
 import "core:thread"
-import "core:unicode/utf8"
-import "core:unicode/utf8/utf8string"
+import "core:time"
+import sfp "send_files_protocol"
 import "vendor:sdl3"
 
 INITIAL_WINDOW_WIDTH :: 800
@@ -38,10 +45,8 @@ ENABLE_PROFILING :: false
 ENABLE_DOCKING :: false
 
 main :: proc() {
-	arena: mem.Arena
-	mem.arena_init(&arena, make([]byte, 2 * 1024 * 1024, context.allocator))
 	context.logger = log.create_console_logger(allocator = context.allocator)
-	context.allocator = mem.arena_allocator(&arena)
+	context.logger.lowest_level = .Info
 
 	lane_count := os.get_processor_core_count()
 	g := new(G, context.allocator)
@@ -152,9 +157,11 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 		//init placeholder values.  TODO: remove after we implement persistance
 		g.my_name = "Dan"
-		_, g.master_secret_key = create_key_pair()
-		// append(&g.contacts, Contact{"Alice", "98765"})
-		// append(&g.contacts, Contact{"Bob", "654321"})
+		_, g.master_secret_key = sfp.create_key_pair()
+
+		io_to_main, err := chan.create(chan.Chan(MainThreadCommand), 1024, context.allocator)
+		ensure(err == nil)
+		g.io_to_main = io_to_main
 
 		// append(
 		// 	&g.transfers,
@@ -178,23 +185,64 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 		// 		0,
 		// 	},
 		// )
+	} else if is_io_thread() {
+
+		err := nbio.acquire_thread_event_loop()
+		ensure(err == nil)
+		g.io_event_loop = nbio.current_thread_event_loop()
+		socket, socket_err := nbio.create_udp_socket(.IP4, g.io_event_loop)
+		ensure(socket_err == nil)
+		g.socket = socket
 	}
 	lane_sync()
+
 
 	if is_main_thread() {
 		run_ui()
-	} else {
-		//TODO
+		nbio.wake_up(g.io_event_loop)
+	} else if is_io_thread() {
+		//IO thread
+
+		ping_server :: proc(op: ^nbio.Operation, g: ^G) {
+			@(static) ping_packet := sfp.Ping{{sfp.VERSION, sfp.PING_MAGIC}}
+			SERVER_ENDPOINT :: nbio.Endpoint{nbio.IP4_Address{107, 23, 192, 242}, 12345}
+			nbio.send(g.socket, {mem.ptr_to_bytes(&ping_packet)}, proc(op: ^nbio.Operation) {
+					if op.send.err != nil {
+						log.warnf("Error sending ping to server: %v", op.send.err)
+					}
+					log.debugf("Sent ping")
+				}, SERVER_ENDPOINT, l = g.io_event_loop)
+
+			nbio.timeout_poly(5 * time.Second, g, ping_server)
+		}
+		pong_packet: sfp.Pong
+		recv_pong :: proc(op: ^nbio.Operation, g: ^G, pong_packet: ^sfp.Pong) {
+			if op.recv.err == nil {
+				ip := net.Address(pong_packet.external_ip)
+				endpoint := net.Endpoint{ip, auto_cast pong_packet.external_port}
+				_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
+			} else {
+				log.errorf("Error receiving pong packet: %v", op.send.err)
+			}
+			nbio.recv_poly2(g.socket, op.recv.bufs, g, pong_packet, recv_pong)
+		}
+		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&pong_packet)}, g, &pong_packet, recv_pong)
+
+		nbio.timeout_poly(0, g, ping_server)
+		for !g.should_quit {
+			err := nbio.tick()
+			if err != nil {
+				fmt.printfln("IO Error: %v", err)
+			}
+		}
 	}
 	lane_sync()
-
-
 }
 build_gui :: proc(g: ^G) {
 	ContactSerialized :: struct #packed {
-		address:    SFPAddress,
+		address:    sfp.Address,
 		name_len:   u32,
-		name_store: [MAX_NAME_SIZE]byte,
+		name_store: [sfp.MAX_NAME_SIZE]byte,
 		crc32:      u32,
 	}
 	ui_contact_text :: proc(contact: Contact) {
@@ -219,12 +267,27 @@ build_gui :: proc(g: ^G) {
 	im.Begin("Main", nil, {.NoCollapse, .NoResize, .NoTitleBar})
 	// im.SetWindowFontScale(2)
 	{
+
+		im.BeginChild("Connection Status", child_flags = {.Borders, .AutoResizeY})
+		im.SeparatorText("Connection Status")
+		if g.external_ip_address.port != 0 {
+			text := fmt.ctprintf(
+				"%v",
+				net.endpoint_to_string(g.external_ip_address, context.temp_allocator),
+			)
+			im.Text("Connected as %s", text)
+		} else {
+			im.Text("Not Connected")
+		}
+		im.EndChild()
+	}
+	{
 		im.BeginChild("Your Contact Info", child_flags = {.Borders, .AutoResizeY})
 		im.SeparatorText("Your Contact Info")
 		im.Text("%s", cstr(g.my_name))
 		im.SameLine()
 		if im.Button("Copy") {
-			address, _ := create_sfp_address(g.master_secret_key)
+			address, _ := sfp.create_sfp_address(g.master_secret_key)
 			contact_info: ContactSerialized
 			contact_info.address = address
 			contact_info.name_len = auto_cast len(g.my_name)
@@ -262,7 +325,33 @@ build_gui :: proc(g: ^G) {
 				im.PushIDInt(auto_cast i)
 				im.TableNextColumn()
 				ui_contact_text(contact)
+				im.SameLine()
 				if im.Button("Send File") {
+					panel := Foundation.OpenPanel_openPanel()
+					panel->setCanChooseDirectories(false)
+					if panel->runModal() == .OK {
+						url := panel->URL()
+						path := string(url->fileSystemRepresentation())
+						file_name := filepath.base(path)
+						file_info, err := os.stat(path, context.temp_allocator)
+						if err == nil {
+							packet: sfp.FileSendRequest
+							pk, sk := sfp.create_key_pair()
+							//TODO start sending file send request packet
+
+							// init_sfp_file_send_request(
+							// 	sk,
+							// 	contact.address,
+							// 	file_info.size,
+							// 	file_name,
+							// 	g.my_name,
+							// )
+						} else {
+							//TODO error message
+							log.errorf("Failed to stat file %v: %v ", path, err)
+						}
+
+					}
 
 				}
 				im.TableNextColumn()
@@ -394,7 +483,7 @@ build_gui :: proc(g: ^G) {
 	//TODO enable once we have persistence
 	if false && len(g.my_name) == 0 {
 		if im.BeginPopupModal("Enter your name") {
-			@(static) inputted_name: [MAX_NAME_SIZE]u8
+			@(static) inputted_name: [sfp.MAX_NAME_SIZE]u8
 			im.Text("Please enter the name you want your contacts to know you by:")
 			submit := im.InputText(
 				"Name",
@@ -424,7 +513,9 @@ run_ui :: proc() {
 
 	last_frame: sdl3.Time
 	assert(sdl3.GetCurrentTime(&last_frame))
+
 	for !g.should_quit {
+
 		when ENABLE_PROFILING {
 			spall.SCOPED_EVENT(&g.spall_ctx, tls.spall_buffer, "frame")
 		}
@@ -434,66 +525,101 @@ run_ui :: proc() {
 		assert(sdl3.GetCurrentTime(&now))
 		dt := now - last_frame
 		last_frame = now
-		if is_main_thread() {
-			e: sdl3.Event
+		e: sdl3.Event
 
-			for sdl3.PollEvent(&e) {
-				imgui_impl_sdl3.ProcessEvent(&e)
+		for sdl3.PollEvent(&e) {
+			imgui_impl_sdl3.ProcessEvent(&e)
 
-				#partial switch e.type {
-				case .QUIT:
-					g.should_quit = true
-				case .WINDOW_RESIZED:
-					g.window_width = e.window.data1
-					g.window_height = e.window.data2
+			#partial switch e.type {
+			case .QUIT:
+				g.should_quit = true
+			case .WINDOW_RESIZED:
+				g.window_width = e.window.data1
+				g.window_height = e.window.data2
 
-				}
 			}
-			imgui_impl_sdlgpu3.NewFrame()
-			imgui_impl_sdl3.NewFrame()
-			im.NewFrame()
-
-			build_gui(g)
-
-			im.Render()
-			draw_data := im.GetDrawData()
-			command_buffer := sdl3.AcquireGPUCommandBuffer(g.gpu_device)
-			swapchain_texture: ^sdl3.GPUTexture
-			swapchain_ok := sdl3.WaitAndAcquireGPUSwapchainTexture(
-				command_buffer,
-				g.window,
-				&swapchain_texture,
-				nil,
-				nil,
-			)
-			assert(swapchain_ok)
-
-			if swapchain_texture != nil {
-				// This is mandatory: call PrepareDrawData() to upload the vertex/index buffer!
-				imgui_impl_sdlgpu3.PrepareDrawData(draw_data, command_buffer)
-
-				color_target_infos := sdl3.GPUColorTargetInfo {
-					texture     = swapchain_texture,
-					clear_color = {0, 0, 0, 1},
-					load_op     = .CLEAR,
-					store_op    = .STORE,
-				}
-				render_pass := sdl3.BeginGPURenderPass(command_buffer, &color_target_infos, 1, nil)
-				imgui_impl_sdlgpu3.RenderDrawData(draw_data, command_buffer, render_pass)
-
-				sdl3.EndGPURenderPass(render_pass)
+		}
+		if received, ok := chan.try_recv(g.io_to_main); ok {
+			switch command in received {
+			case NewIPAddress:
+				g.external_ip_address = command.endpoint
 			}
+		}
+		imgui_impl_sdlgpu3.NewFrame()
+		imgui_impl_sdl3.NewFrame()
+		im.NewFrame()
 
-			when ENABLE_DOCKING {
-				im.UpdatePlatformWindows()
-				im.RenderPlatformWindowsDefault()
+		build_gui(g)
+
+		im.Render()
+		draw_data := im.GetDrawData()
+		command_buffer := sdl3.AcquireGPUCommandBuffer(g.gpu_device)
+		swapchain_texture: ^sdl3.GPUTexture
+		swapchain_ok := sdl3.WaitAndAcquireGPUSwapchainTexture(
+			command_buffer,
+			g.window,
+			&swapchain_texture,
+			nil,
+			nil,
+		)
+		assert(swapchain_ok)
+
+		if swapchain_texture != nil {
+			// This is mandatory: call PrepareDrawData() to upload the vertex/index buffer!
+			imgui_impl_sdlgpu3.PrepareDrawData(draw_data, command_buffer)
+
+			color_target_infos := sdl3.GPUColorTargetInfo {
+				texture     = swapchain_texture,
+				clear_color = {0, 0, 0, 1},
+				load_op     = .CLEAR,
+				store_op    = .STORE,
 			}
+			render_pass := sdl3.BeginGPURenderPass(command_buffer, &color_target_infos, 1, nil)
+			imgui_impl_sdlgpu3.RenderDrawData(draw_data, command_buffer, render_pass)
 
-			assert(sdl3.SubmitGPUCommandBuffer(command_buffer))
-
+			sdl3.EndGPURenderPass(render_pass)
 		}
 
+		when ENABLE_DOCKING {
+			im.UpdatePlatformWindows()
+			im.RenderPlatformWindowsDefault()
+		}
 
+		assert(sdl3.SubmitGPUCommandBuffer(command_buffer))
+
+	}
+
+
+}
+
+//TODO push lane context
+
+// Automatic profiling of every procedure:
+
+@(instrumentation_enter)
+spall_enter :: proc "contextless" (
+	proc_address, call_site_return_address: rawptr,
+	loc: runtime.Source_Code_Location,
+) {
+
+	when ENABLE_PROFILING {
+		g := tls.g
+		if g != nil {
+			spall._buffer_begin(&g.spall_ctx, tls.spall_buffer, "", "", loc)
+		}
+	}
+}
+
+@(instrumentation_exit)
+spall_exit :: proc "contextless" (
+	proc_address, call_site_return_address: rawptr,
+	loc: runtime.Source_Code_Location,
+) {
+	when ENABLE_PROFILING {
+		g := tls.g
+		if g != nil {
+			spall._buffer_end(&g.spall_ctx, tls.spall_buffer)
+		}
 	}
 }
 
@@ -542,70 +668,66 @@ lane_pop_ctx :: proc() {
 	tls.lane_ctx = pop(&tls.lane_contexts)
 }
 
-//TODO push lane context
-
-// Automatic profiling of every procedure:
-
-@(instrumentation_enter)
-spall_enter :: proc "contextless" (
-	proc_address, call_site_return_address: rawptr,
-	loc: runtime.Source_Code_Location,
-) {
-
-	when ENABLE_PROFILING {
-		g := tls.g
-		if g != nil {
-			spall._buffer_begin(&g.spall_ctx, tls.spall_buffer, "", "", loc)
-		}
-	}
-}
-
-@(instrumentation_exit)
-spall_exit :: proc "contextless" (
-	proc_address, call_site_return_address: rawptr,
-	loc: runtime.Source_Code_Location,
-) {
-	when ENABLE_PROFILING {
-		g := tls.g
-		if g != nil {
-			spall._buffer_end(&g.spall_ctx, tls.spall_buffer)
-		}
-	}
-}
-
 @(thread_local)
 tls: TLS
 
 G :: struct {
-	should_quit:       bool,
-	spall_ctx:         spall.Context,
-	window_width:      i32,
-	window_height:     i32,
+	should_quit:         bool,
+	spall_ctx:           spall.Context,
+	window_width:        i32,
+	window_height:       i32,
 
 
 	//UI
-	im_io:             ^im.IO,
+	im_io:               ^im.IO,
 
+	//UI Transient State
+	external_ip_address: net.Endpoint,
 	//Persistent State
-	contacts:          [dynamic]Contact,
-	transfers:         [dynamic]Transfer,
-	my_name:           string,
-	master_secret_key: SecretKey,
+	contacts:            [dynamic]Contact,
+	transfers:           [dynamic]Transfer,
+	my_name:             string,
+	master_secret_key:   sfp.SecretKey,
+
+	//IO
+	io_event_loop:       ^nbio.Event_Loop,
+	socket:              nbio.UDP_Socket,
+
+	//Inter-thread communication
+	io_to_main:          chan.Chan(MainThreadCommand),
 
 
 	//platform specific
-	window:            ^sdl3.Window,
-	atlas_texture:     ^sdl3.Texture,
-	gpu_device:        ^sdl3.GPUDevice,
+	window:              ^sdl3.Window,
+	atlas_texture:       ^sdl3.Texture,
+	gpu_device:          ^sdl3.GPUDevice,
 }
 
+MainThreadCommand :: union {
+	NewIPAddress,
+}
+NewIPAddress :: struct {
+	endpoint: net.Endpoint,
+}
+
+TLS :: struct {
+	g:              ^G,
+	spall_ctx:      ^spall.Buffer,
+	using lane_ctx: LaneContext,
+	lane_contexts:  [dynamic; 64]LaneContext,
+}
+LaneContext :: struct {
+	lane_id:    int,
+	lane_count: int,
+	barrier:    ^sync.Barrier,
+}
+
+
 //File Transfer related
-MAX_NAME_SIZE :: 64
-MAX_FILE_NAME_SIZE :: 512
 
 Contact :: struct {
-	name:    [dynamic; MAX_NAME_SIZE]byte,
-	address: SFPAddress, //TODO: make real public key
+	name:    [dynamic; sfp.MAX_NAME_SIZE]byte,
+	address: sfp.Address, //TODO: make real public key
 }
 Transfer :: struct {
 	file_name:                    string,
@@ -626,316 +748,8 @@ TransferStatus :: enum {
 }
 
 //Send Files Protocol (SFP) stuff
-SFP_VERSION :: i32(0)
-
-//unencrypted header containing only necessary information needed for decryption
-SFPPacketHeader :: struct #packed {
-	version:          i32,
-	session_id:       PublicKey,
-	encryption_tag:   [chacha20poly1305.TAG_SIZE]byte,
-	encryption_nonce: [chacha20poly1305.XIV_SIZE]byte,
-}
-//All encrypted payloads must start with this header
-SFPPacketPayloadHeader :: struct #packed {
-	op: SFPOp,
-}
-PublicKey :: distinct [x25519.POINT_SIZE]byte
-SecretKey :: distinct [x25519.SCALAR_SIZE]byte
-
-SFPAddress :: struct #packed {
-	label:      [16]byte, //This is used by the recipient to derive the secret key from their master secret key
-	public_key: PublicKey,
-}
-
-create_key_pair :: proc() -> (pk: PublicKey, sk: SecretKey) {
-	crypto.rand_bytes(sk[:])
-	x25519.scalarmult_basepoint(pk[:], sk[:])
-	return
-}
-
-create_sfp_address :: proc(
-	master_secret_key: SecretKey,
-) -> (
-	address: SFPAddress,
-	secret_key: SecretKey,
-) {
-	master_secret_key := master_secret_key
-
-	crypto.rand_bytes(address.label[:])
-
-	sha_ctx: sha2.Context_256
-	sha2.init_256(&sha_ctx)
-	sha2.update(&sha_ctx, master_secret_key[:])
-	sha2.update(&sha_ctx, address.label[:])
-	sha2.final(&sha_ctx, secret_key[:])
-
-	x25519.scalarmult_basepoint(address.public_key[:], secret_key[:])
-
-	return
-}
-derive_and_validate_secret_key_from_sfp_address :: proc(
-	address: SFPAddress,
-	master_secret_key: SecretKey,
-) -> (
-	SecretKey,
-	bool,
-) {
-	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
-	pk: PublicKey
-	x25519.scalarmult_basepoint(pk[:], sk[:])
-	if pk != address.public_key {
-		return {}, false
-	}
-	return sk, true
-}
-derive_secret_key_from_sfp_address :: proc(
-	address: SFPAddress,
-	master_secret_key: SecretKey,
-) -> SecretKey {
-	result: SecretKey
-
-	master_secret_key := master_secret_key
-	address := address
-
-	sha_ctx: sha2.Context_256
-	sha2.init_256(&sha_ctx)
-	sha2.update(&sha_ctx, master_secret_key[:])
-	sha2.update(&sha_ctx, address.label[:])
-	sha2.final(&sha_ctx, result[:])
-
-	return result
-}
-
-validate_sfp_address_is_mine :: proc(address: SFPAddress, master_secret_key: SecretKey) -> bool {
-	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
-	pk: PublicKey
-	x25519.scalarmult_basepoint(pk[:], sk[:])
-	if pk != address.public_key {
-		return false
-	}
-	return true
-}
-
-SFPFileSendRequest :: struct #packed {
-	using header:      SFPPacketHeader,
-	target_address:    SFPAddress,
-	encrypted_payload: [size_of(SFPFileSendRequestPayload)]byte,
-}
-SFPFileSendRequestPayload :: struct #packed {
-	using header:     SFPPacketPayloadHeader,
-	reply_ip_address: nbio.IP4_Address,
-	reply_port:       u16,
-	file_size:        i64,
-	file_name:        [dynamic; MAX_FILE_NAME_SIZE]byte,
-	requester_name:   [dynamic; MAX_NAME_SIZE]byte,
-}
-
-
-#assert(
-	size_of(SFPFileSendRequest) == 4 + 4 + 32 + 32 + 16 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 64,
-)
-
-init_sfp_file_send_request :: proc(
-	ephemeral_secret_key: SecretKey,
-	target_address: SFPAddress,
-	file_size: i64,
-	file_name: string,
-	requester_name: string,
-	reply_ip_address: nbio.IP4_Address,
-	reply_port: u16,
-	out_packet: ^SFPFileSendRequest,
-) {
-	out_packet.version = SFP_VERSION
-
-	//set up payload to be encrypted
-	payload: SFPFileSendRequestPayload
-	{
-		payload.op = .FileSendRequest
-		payload.file_size = file_size
-		resize(&payload.file_name, len(file_name))
-		copy(payload.file_name[:], file_name[:])
-		resize(&payload.requester_name, len(requester_name))
-		copy(payload.requester_name[:], requester_name[:])
-		payload.reply_ip_address = reply_ip_address
-		payload.reply_port = reply_port
-	}
-
-
-	//calculate the encryption key
-	encryption_key: SecretKey
-	{
-		ephemeral_secret_key := ephemeral_secret_key
-		x25519.scalarmult_basepoint(out_packet.session_id[:], ephemeral_secret_key[:])
-
-		out_packet.target_address = target_address
-
-		x25519.scalarmult(
-			encryption_key[:],
-			ephemeral_secret_key[:],
-			out_packet.target_address.public_key[:],
-		)
-
-		sha_ctx: sha2.Context_256
-		sha2.init_256(&sha_ctx)
-		sha2.update(&sha_ctx, encryption_key[:])
-		sha2.final(&sha_ctx, encryption_key[:])
-	}
-
-	crypto.rand_bytes(out_packet.encryption_nonce[:])
-
-	payload_bytes := mem.byte_slice(&payload, size_of(payload))
-
-	aead.seal_oneshot(
-		.XCHACHA20POLY1305,
-		payload_bytes,
-		out_packet.encryption_tag[:],
-		encryption_key[:],
-		out_packet.encryption_nonce[:],
-		nil,
-		payload_bytes,
-	)
-	copy(out_packet.encrypted_payload[:], payload_bytes[:])
-}
-parse_sfp_file_send_request :: proc(
-	master_secret_key: SecretKey,
-	out_payload: ^SFPFileSendRequestPayload,
-	in_packet: ^SFPFileSendRequest,
-) -> bool {
-	//calculate the encryption key
-	encryption_key: SecretKey
-	{
-		target_secret_key, valid := derive_and_validate_secret_key_from_sfp_address(
-			in_packet.target_address,
-			master_secret_key,
-		)
-		if !valid {
-			return false
-		}
-
-		x25519.scalarmult(encryption_key[:], target_secret_key[:], in_packet.session_id[:])
-
-		sha_ctx: sha2.Context_256
-		sha2.init_256(&sha_ctx)
-		sha2.update(&sha_ctx, encryption_key[:])
-		sha2.final(&sha_ctx, encryption_key[:])
-	}
-
-	garbage := [24]byte{}
-	decrypted := aead.open_oneshot(
-		.XCHACHA20POLY1305,
-		in_packet.encrypted_payload[:],
-		encryption_key[:],
-		in_packet.encryption_nonce[:],
-		nil,
-		in_packet.encrypted_payload[:],
-		in_packet.encryption_tag[:],
-	)
-	if !decrypted {
-		return false
-	}
-
-	decrypted_payload := transmute(^SFPFileSendRequestPayload)&in_packet.encrypted_payload
-	out_payload^ = decrypted_payload^
-
-	return true
-
-}
-
-
-SFPFileSendRequestAccept :: struct #packed {
-	using header:      SFPPacketHeader,
-	encrypted_payload: [size_of(SFPFileSendRequestAcceptPayload)]byte,
-}
-SFPFileSendRequestAcceptPayload :: struct #packed {
-	using header:     SFPPacketPayloadHeader,
-	receiver_address: SFPAddress, //used for validation purposes
-}
-init_sfp_file_send_request_accept :: proc(
-	receiver_master_secret_key: SecretKey,
-	receiver_address: SFPAddress,
-	session_id: PublicKey,
-	out_packet: ^SFPFileSendRequestAccept,
-) {
-	out_packet.version = SFP_VERSION
-
-	//set up payload to be encrypted
-	payload: SFPFileSendRequestAcceptPayload
-	{
-		payload.op = .AcceptFileSendRequest
-		payload.receiver_address = receiver_address
-	}
-
-
-	//calculate the encryption key
-	encryption_key: SecretKey
-	{
-		sk := derive_secret_key_from_sfp_address(receiver_address, receiver_master_secret_key)
-		x25519.scalarmult_basepoint(out_packet.session_id[:], sk[:])
-
-
-		session_id := session_id
-		x25519.scalarmult(encryption_key[:], sk[:], session_id[:])
-
-		sha_ctx: sha2.Context_256
-		sha2.init_256(&sha_ctx)
-		sha2.update(&sha_ctx, encryption_key[:])
-		sha2.final(&sha_ctx, encryption_key[:])
-	}
-
-	crypto.rand_bytes(out_packet.encryption_nonce[:])
-
-	payload_bytes := mem.byte_slice(&payload, size_of(payload))
-
-	aead.seal_oneshot(
-		.XCHACHA20POLY1305,
-		payload_bytes,
-		out_packet.encryption_tag[:],
-		encryption_key[:],
-		out_packet.encryption_nonce[:],
-		nil,
-		payload_bytes,
-	)
-	copy(out_packet.encrypted_payload[:], payload_bytes[:])
-}
-
-
-SFP_MAX_DATA_CHUNK_SIZE :: 16 * 1024
-
-SFPFileDataPacket :: struct #packed {
-	using header: SFPPacketHeader,
-	payload:      [size_of(SFPFileDataPayload)]byte,
-}
-// #assert(size_of(SFPFileDataPacket) == 4 + 4 + 32 + 24 + 16 + 8 + 8 + 16 * 1024)
-
-SFPFileDataPayload :: struct #packed {
-	file_offset:     i64,
-	file_data_chunk: [dynamic; SFP_MAX_DATA_CHUNK_SIZE]byte,
-}
-
-init_sfp_file_data_packet :: proc(offset: i64, data: []byte, out_packet: ^SFPFileDataPacket) {
-}
-
-SFPOp :: enum (i32) {
-	None = 0,
-	FileSendRequest,
-	AcceptFileSendRequest,
-	FileData,
-	ResendFileData,
-}
 
 //Application specific
-TLS :: struct {
-	g:              ^G,
-	spall_ctx:      ^spall.Buffer,
-	using lane_ctx: LaneContext,
-	lane_contexts:  [dynamic; 64]LaneContext,
-}
-LaneContext :: struct {
-	lane_id:    int,
-	lane_count: int,
-	barrier:    ^sync.Barrier,
-}
-
 
 //crc32
 init_crc32 :: proc(crc: ^u32) {
@@ -1208,3 +1022,17 @@ crc32_table := [256]u32 {
 	0x5A05DF1B,
 	0x2D02EF8D,
 }
+
+
+//thread-safe queue
+// ThreadSafeQueue :: struct($T: typeid) {
+// 	q:     queue.Queue(T),
+// 	mutex: sync.Mutex,
+// }
+// init_queue :: proc(q: ^ThreadSafeQueue) {
+// 	queue.init(q.q)
+// }
+// push :: proc(q: ^$Q/ThreadSafeQueue($T), item: T) {
+// 	sync.guard(&q.mutex)
+// 	queue.push(q.q, item)
+// }

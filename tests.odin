@@ -9,6 +9,7 @@ import "core:mem"
 import "core:nbio"
 import "core:net"
 import "core:sync"
+import sfp "send_files_protocol"
 run_tests :: proc() {
 	g := tls.g
 
@@ -26,17 +27,17 @@ run_tests :: proc() {
 
 test_constructing_parsing_file_send_request_packet :: proc() {
 	if is_main_thread() {
-		sender_ephemeral_secret_key: SecretKey
+		sender_ephemeral_secret_key: sfp.SecretKey
 		crypto.rand_bytes(sender_ephemeral_secret_key[:])
 
-		target_master_secret_key: SecretKey
+		target_master_secret_key: sfp.SecretKey
 		crypto.rand_bytes(target_master_secret_key[:])
 
-		target_address, target_secret_key := create_sfp_address(target_master_secret_key)
+		target_address, target_secret_key := sfp.create_sfp_address(target_master_secret_key)
 
 		x25519.scalarmult_basepoint(target_address.public_key[:], target_secret_key[:])
 
-		packet: SFPFileSendRequest
+		packet: sfp.FileSendRequest
 
 		FILE_NAME :: "hello.mp4"
 		FILE_SIZE :: 1234
@@ -44,7 +45,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 		IP_ADDR :: nbio.IP4_Address{127, 0, 0, 1}
 		PORT :: 12345
 
-		init_sfp_file_send_request(
+		sfp.init_sfp_file_send_request(
 			sender_ephemeral_secret_key,
 			target_address,
 			FILE_SIZE,
@@ -54,8 +55,8 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 			PORT,
 			&packet,
 		)
-		payload: SFPFileSendRequestPayload
-		ok := parse_sfp_file_send_request(target_master_secret_key, &payload, &packet)
+		payload: sfp.FileSendRequestPayload
+		ok := sfp.parse_sfp_file_send_request(target_master_secret_key, &payload, &packet)
 		ensure(ok)
 		ensure(string(payload.file_name[:]) == FILE_NAME)
 		ensure(payload.file_size == FILE_SIZE)
@@ -75,12 +76,12 @@ test_sending_file_send_request :: proc() {
 	DISCOVER_NODE_PORT :: 54321
 	RECEIVER_CLIENT_PORT :: 65432
 
-	@(static) receiver_master_sk: SecretKey
-	@(static) receiver_address: SFPAddress
-	@(static) receiver_address_sk: SecretKey
+	@(static) receiver_master_sk: sfp.SecretKey
+	@(static) receiver_address: sfp.Address
+	@(static) receiver_address_sk: sfp.SecretKey
 	if is_main_thread() {
-		_, receiver_master_sk = create_key_pair()
-		receiver_address, receiver_address_sk = create_sfp_address(receiver_master_sk)
+		_, receiver_master_sk = sfp.create_key_pair()
+		receiver_address, receiver_address_sk = sfp.create_sfp_address(receiver_master_sk)
 	}
 	lane_sync()
 
@@ -88,9 +89,9 @@ test_sending_file_send_request :: proc() {
 	if is_main_thread() {
 		nbio.acquire_thread_event_loop()
 		defer nbio.release_thread_event_loop()
-		ephemeral_pk, ephemperal_sk := create_key_pair()
-		file_send_request_packet: SFPFileSendRequest
-		init_sfp_file_send_request(
+		ephemeral_pk, ephemperal_sk := sfp.create_key_pair()
+		file_send_request_packet: sfp.FileSendRequest
+		sfp.init_sfp_file_send_request(
 			ephemperal_sk,
 			receiver_address,
 			FILE_SIZE,
@@ -102,7 +103,10 @@ test_sending_file_send_request :: proc() {
 		)
 		socket, socket_err := nbio.create_udp_socket(.IP4)
 		ensure(socket_err == .None)
-		defer nbio.close(socket)
+		defer {
+			nbio.close(socket)
+			nbio.run()
+		}
 		nbio.send(
 			socket,
 			{mem.byte_slice(&file_send_request_packet, size_of(file_send_request_packet))},
@@ -127,19 +131,22 @@ test_sending_file_send_request :: proc() {
 		ensure(socket_err == .None)
 		bind_err := nbio.bind(socket, {nbio.IP4_Loopback, RECEIVER_CLIENT_PORT})
 		ensure(bind_err == .None)
-		defer nbio.close(socket)
+		defer {
+			nbio.close(socket)
+			nbio.run()
+		}
 
-		file_send_request: SFPFileSendRequest
+		file_send_request: sfp.FileSendRequest
 		nbio.recv(
 			socket,
 			{mem.byte_slice(&file_send_request, size_of(file_send_request))},
 			proc(op: ^nbio.Operation) {
 				err := op.recv.err
 				if err == nil {
-					incoming_packet := cast(^SFPFileSendRequest)raw_data(op.recv.bufs[0])
-					payload: SFPFileSendRequestPayload
+					incoming_packet := cast(^sfp.FileSendRequest)raw_data(op.recv.bufs[0])
+					payload: sfp.FileSendRequestPayload
 
-					success := parse_sfp_file_send_request(
+					success := sfp.parse_sfp_file_send_request(
 						receiver_master_sk,
 						&payload,
 						incoming_packet,
@@ -232,14 +239,14 @@ test_sending_file_send_request :: proc() {
 // 			start:  int,
 // 			end:    int,
 // 			offset: int,
-// 			buffer: [SFP_FILE_DATA_CHUNK_SIZE]byte,
+// 			buffer: [sfp._FILE_DATA_CHUNK_SIZE]byte,
 // 		}
 
 // 		send_ctx.offset = send_ctx.start
 
 
 // 		file_read_callback :: proc(op: ^nbio.Operation, g: ^TestingG, send_ctx: ^SendContext) {
-// 			file_packet: SFPFileDataPacket
+// 			file_packet: sfp.FileDataPacket
 // 			init_sfp_file_data_packet(auto_cast op.read.offset, op.read.buf, &file_packet)
 // 			logf("Sending %v bytes: %v/%v", len(op.read.buf), op.read.offset, g.file_size)
 // 			nbio.send_poly2(
@@ -253,7 +260,7 @@ test_sending_file_send_request :: proc() {
 // 		}
 // 		send_file_callback :: proc(op: ^nbio.Operation, g: ^TestingG, send_ctx: ^SendContext) {
 // 			send_ctx.offset += op.send.sent
-// 			to_send := min(send_ctx.end - send_ctx.offset, SFP_FILE_DATA_CHUNK_SIZE)
+// 			to_send := min(send_ctx.end - send_ctx.offset, sfp._FILE_DATA_CHUNK_SIZE)
 // 			if to_send > 0 {
 // 				nbio.read_poly2(
 // 					g.read_file_handle,
