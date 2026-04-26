@@ -14,7 +14,7 @@ if $IS_MAC_OS; then
 fi
 compile() {
     if $IS_MAC_OS; then
-        odin build . -o:none -debug -sanitize:address -out:$BUILD_DIR/$NAME
+        odin build . -o:none -debug -sanitize:address -extra-linker-flags:"-lstdc++" -out:$BUILD_DIR/$NAME
         # odin build . -o:none -debug  -out:$BUILD_DIR/$NAME
         # odin build . -o:speed -out:$BUILD_DIR/$NAME
         codesign -s - --entitlements entitlements.plist --force $BUILD_DIR/$NAME

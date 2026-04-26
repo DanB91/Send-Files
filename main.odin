@@ -6,6 +6,7 @@ package main
 import im "3rdparty/imgui"
 import "3rdparty/imgui/imgui_impl_sdl3"
 import "3rdparty/imgui/imgui_impl_sdlgpu3"
+import igfd "3rdparty/imgui_file_dialog"
 import "base:runtime"
 import "core:bytes"
 import "core:c"
@@ -43,6 +44,8 @@ FONT_MULTIPLIER :: 1
 
 ENABLE_PROFILING :: false
 ENABLE_DOCKING :: false
+
+SERVER_ENDPOINT :: nbio.Endpoint{nbio.IP4_Address{107, 23, 192, 242}, 12345}
 
 main :: proc() {
 	context.logger = log.create_console_logger(allocator = context.allocator)
@@ -153,6 +156,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 			SwapchainComposition = .SDR,
 		}
 		imgui_impl_sdlgpu3.Init(&init_info)
+		g.igfd_ctx = igfd.Create()
 
 
 		//init placeholder values.  TODO: remove after we implement persistance
@@ -205,7 +209,6 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 		ping_server :: proc(op: ^nbio.Operation, g: ^G) {
 			@(static) ping_packet := sfp.Ping{{sfp.VERSION, sfp.PING_MAGIC}}
-			SERVER_ENDPOINT :: nbio.Endpoint{nbio.IP4_Address{107, 23, 192, 242}, 12345}
 			nbio.send(g.socket, {mem.ptr_to_bytes(&ping_packet)}, proc(op: ^nbio.Operation) {
 					if op.send.err != nil {
 						log.warnf("Error sending ping to server: %v", op.send.err)
@@ -320,38 +323,49 @@ build_gui :: proc(g: ^G) {
 		im.SeparatorText("Contacts")
 		if im.BeginTable("Contacts", 4) {
 
-			for contact, i in g.contacts {
+			for &contact, i in g.contacts {
 				im.TableNextColumn()
 				im.PushIDInt(auto_cast i)
 				im.TableNextColumn()
 				ui_contact_text(contact)
 				im.SameLine()
-				if im.Button("Send File") {
-					panel := Foundation.OpenPanel_openPanel()
-					panel->setCanChooseDirectories(false)
-					if panel->runModal() == .OK {
-						url := panel->URL()
-						path := string(url->fileSystemRepresentation())
-						file_name := filepath.base(path)
-						file_info, err := os.stat(path, context.temp_allocator)
-						if err == nil {
-							packet: sfp.FileSendRequest
-							pk, sk := sfp.create_key_pair()
-							//TODO start sending file send request packet
+				if g.external_ip_address.port != 0 && im.Button("Send File") {
+					config := igfd.FileDialog_Config_Get()
+					//TODO fill out config
+					config.flags = {.Modal, .ReadOnlyFileNameField, .DisableCreateDirectoryButton}
+					config.user_datas = &contact
+					igfd.OpenDialog(
+						g.igfd_ctx,
+						"Choose File To Send",
+						"Choose File To Send",
+						".*",
+						config,
+					)
+					// panel := Foundation.OpenPanel_openPanel()
+					// panel->setCanChooseDirectories(false)
+					// if panel->runModal() == .OK {
+					// 	url := panel->URL()
+					// 	path := string(url->fileSystemRepresentation())
+					// 	file_name := filepath.base(path)
+					// 	file_info, err := os.stat(path, context.temp_allocator)
+					// 	if err == nil {
+					// 		packet: sfp.FileSendRequest
+					// 		pk, sk := sfp.create_key_pair()
+					// 		//TODO start sending file send request packet
 
-							// init_sfp_file_send_request(
-							// 	sk,
-							// 	contact.address,
-							// 	file_info.size,
-							// 	file_name,
-							// 	g.my_name,
-							// )
-						} else {
-							//TODO error message
-							log.errorf("Failed to stat file %v: %v ", path, err)
-						}
+					// 		// init_sfp_file_send_request(
+					// 		// 	sk,
+					// 		// 	contact.address,
+					// 		// 	file_info.size,
+					// 		// 	file_name,
+					// 		// 	g.my_name,
+					// 		// )
+					// 	} else {
+					// 		//TODO error message
+					// 		log.errorf("Failed to stat file %v: %v ", path, err)
+					// 	}
 
-					}
+					// }
 
 				}
 				im.TableNextColumn()
@@ -417,7 +431,7 @@ build_gui :: proc(g: ^G) {
 
 	}
 	{
-		human_readable_file_size :: proc(size: int) -> cstring {
+		human_readable_file_size :: proc(size: i64) -> cstring {
 			result: cstring
 			switch size {
 			case 0 ..< 1000:
@@ -500,6 +514,100 @@ build_gui :: proc(g: ^G) {
 		}
 		im.OpenPopup("Enter your name")
 
+	}
+	if igfd.DisplayDialog(
+		g.igfd_ctx,
+		"Choose File To Send",
+		{.NoCollapse},
+		{INITIAL_WINDOW_WIDTH / 1.25, INITIAL_WINDOW_HEIGHT / 1.5},
+		{max(f32), max(f32)},
+	) {
+		if igfd.IsOk(g.igfd_ctx) {
+			path := string(igfd.GetFilePathName(g.igfd_ctx, .KeepInputFile))
+			file_name := filepath.base(path)
+			file_info, err := os.stat(path, context.temp_allocator)
+			if err == nil {
+				session_id, sk := sfp.create_key_pair()
+				contact := cast(^Contact)igfd.GetUserDatas(g.igfd_ctx)
+
+				append(&g.transfers, Transfer{})
+
+				transfer := &g.transfers[len(g.transfers) - 1]
+				{
+					transfer_arena: mem.Arena
+					mem.arena_init(&transfer_arena, make([]byte, 512 * 1024, context.allocator))
+					transfer_allocator := mem.arena_allocator(&transfer_arena)
+
+					file_slices_to_be_transfered := make([dynamic]FileSlice, transfer_allocator)
+					append(&file_slices_to_be_transfered, FileSlice{0, file_info.size})
+
+
+					transfer^ = Transfer {
+						allocator                    = transfer_allocator,
+						file_name                    = strings.clone(
+							file_name,
+							transfer_allocator,
+						),
+						file_size                    = file_info.size,
+						counter_party                = contact^,
+						status                       = .Requested,
+						file_slices_to_be_transfered = file_slices_to_be_transfered,
+						rate                         = 0,
+					}
+				}
+
+				packet := new(sfp.FileSendRequest, transfer.allocator)
+				sfp.init_sfp_file_send_request(
+					sk,
+					session_id,
+					contact.address,
+					file_info.size,
+					file_name,
+					g.my_name,
+					g.external_ip_address.address.(net.IP4_Address),
+					auto_cast g.external_ip_address.port,
+					packet,
+				)
+				repeat_file_send_request_until_accepted :: proc(
+					op: ^nbio.Operation,
+					packet: ^sfp.FileSendRequest,
+					transfer: ^Transfer,
+					g: ^G,
+				) {
+
+					nbio.send(
+						g.socket,
+						{mem.ptr_to_bytes(packet)},
+						proc(op: ^nbio.Operation) {},
+						SERVER_ENDPOINT,
+					)
+					if transfer.status == .Requested {
+						nbio.timeout_poly3(
+							5 * time.Second,
+							packet,
+							transfer,
+							g,
+							repeat_file_send_request_until_accepted,
+							g.io_event_loop,
+						)
+
+					}
+				}
+				nbio.timeout_poly3(
+					0,
+					packet,
+					transfer,
+					g,
+					repeat_file_send_request_until_accepted,
+					g.io_event_loop,
+				)
+			} else {
+				//TODO error message
+				log.errorf("Failed to stat file %v: %v ", path, err)
+			}
+
+		}
+		igfd.CloseDialog(g.igfd_ctx)
 	}
 
 
@@ -680,12 +788,13 @@ G :: struct {
 
 	//UI
 	im_io:               ^im.IO,
+	igfd_ctx:            ^igfd.ImGuiFileDialog,
 
 	//UI Transient State
 	external_ip_address: net.Endpoint,
 	//Persistent State
-	contacts:            [dynamic]Contact,
-	transfers:           [dynamic]Transfer,
+	contacts:            [dynamic; 4096]Contact,
+	transfers:           [dynamic; 4096]Transfer,
 	my_name:             string,
 	master_secret_key:   sfp.SecretKey,
 
@@ -730,19 +839,21 @@ Contact :: struct {
 	address: sfp.Address, //TODO: make real public key
 }
 Transfer :: struct {
+	allocator:                    mem.Allocator,
 	file_name:                    string,
-	file_size:                    int,
+	file_size:                    i64,
 	counter_party:                Contact,
 	status:                       TransferStatus,
 	file_slices_to_be_transfered: [dynamic]FileSlice,
 	rate:                         f64,
 }
 FileSlice :: struct {
-	offset: int,
-	len:    int,
+	offset: i64,
+	len:    i64,
 }
 TransferStatus :: enum {
 	NotStarted,
+	Requested,
 	//...
 	Transferring,
 }

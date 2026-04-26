@@ -27,15 +27,14 @@ run_tests :: proc() {
 
 test_constructing_parsing_file_send_request_packet :: proc() {
 	if is_main_thread() {
-		sender_ephemeral_secret_key: sfp.SecretKey
-		crypto.rand_bytes(sender_ephemeral_secret_key[:])
+		session_id, sender_ephemeral_secret_key := sfp.create_key_pair()
 
 		target_master_secret_key: sfp.SecretKey
 		crypto.rand_bytes(target_master_secret_key[:])
 
 		target_address, target_secret_key := sfp.create_sfp_address(target_master_secret_key)
 
-		x25519.scalarmult_basepoint(target_address.public_key[:], target_secret_key[:])
+		// x25519.scalarmult_basepoint(target_address.public_key[:], target_secret_key[:])
 
 		packet: sfp.FileSendRequest
 
@@ -47,6 +46,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 
 		sfp.init_sfp_file_send_request(
 			sender_ephemeral_secret_key,
+			session_id,
 			target_address,
 			FILE_SIZE,
 			FILE_NAME,
@@ -93,6 +93,7 @@ test_sending_file_send_request :: proc() {
 		file_send_request_packet: sfp.FileSendRequest
 		sfp.init_sfp_file_send_request(
 			ephemperal_sk,
+			ephemeral_pk,
 			receiver_address,
 			FILE_SIZE,
 			FILE_NAME,

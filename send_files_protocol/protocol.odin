@@ -146,6 +146,7 @@ FileSendRequestPayload :: struct #packed {
 
 init_sfp_file_send_request :: proc(
 	ephemeral_secret_key: SecretKey,
+	session_id: PublicKey,
 	target_address: Address,
 	file_size: i64,
 	file_name: string,
@@ -174,7 +175,7 @@ init_sfp_file_send_request :: proc(
 	encryption_key: SecretKey
 	{
 		ephemeral_secret_key := ephemeral_secret_key
-		x25519.scalarmult_basepoint(out_packet.session_id[:], ephemeral_secret_key[:])
+		out_packet.session_id = session_id
 
 		out_packet.target_address = target_address
 
