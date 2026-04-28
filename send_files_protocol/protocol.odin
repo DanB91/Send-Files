@@ -27,17 +27,6 @@ Pong :: struct #packed {
 	external_port: u16,
 }
 
-RENDEZVOUS_MAGIC :: 0x646E6572 //ASCII for "rend"
-Rendezvous :: struct #packed {
-	version:           i32,
-	magic:             u32,
-	target_ip_address: nbio.IP4_Address,
-	target_port:       u16,
-	reply_ip_address:  nbio.IP4_Address,
-	reply_port:        u16,
-	session_id:        PublicKey,
-}
-
 
 //unencrypted header containing only necessary information needed for decryption
 PacketHeader :: struct #packed {

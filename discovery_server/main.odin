@@ -17,7 +17,7 @@ import "core:thread"
 ENABLE_PROFILING :: false
 PORT :: 12345
 main :: proc() {
-	context.logger = log.create_console_logger(allocator = context.allocator)
+	context.logger = log.create_console_logger(.Warning, allocator = context.allocator)
 	context.logger.options |= {.Thread_Id}
 
 	lane_count := os.get_processor_core_count()
@@ -138,13 +138,10 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 		//Listen thread
 		lane_push_ctx(1, 0, nil)
 		ReceiveBuffer :: struct #raw_union {
-			send_request: sfp.FileSendRequest,
-			ping:         sfp.Ping,
-			rendezvous:   sfp.Rendezvous,
+			send_request:        sfp.FileSendRequest,
+			ping:                sfp.Ping,
+			send_request_accept: sfp.FileSendRequestAccept,
 		}
-		#assert(size_of(sfp.FileSendRequest) != size_of(sfp.Ping))
-		#assert(size_of(sfp.FileSendRequest) != size_of(sfp.Rendezvous))
-		#assert(size_of(sfp.Rendezvous) != size_of(sfp.Ping))
 		buf: ReceiveBuffer
 
 		for {
@@ -177,7 +174,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 							log.warnf("IO thread %v is slow!", id)
 						}
 					}
-				case size_of(buf.rendezvous):
+				case size_of(buf.send_request_accept):
 					id := lane_id_for_ip_source(source, g)
 				//TODO
 				case:

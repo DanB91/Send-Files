@@ -44,6 +44,7 @@ FONT_MULTIPLIER :: 1
 
 ENABLE_PROFILING :: false
 ENABLE_DOCKING :: false
+ENABLE_PACKET_STATS :: true
 
 SERVER_ENDPOINT :: nbio.Endpoint{nbio.IP4_Address{107, 23, 192, 242}, 12345}
 
@@ -207,31 +208,99 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 	} else if is_io_thread() {
 		//IO thread
 
-		ping_server :: proc(op: ^nbio.Operation, g: ^G) {
-			@(static) ping_packet := sfp.Ping{{sfp.VERSION, sfp.PING_MAGIC}}
-			nbio.send(g.socket, {mem.ptr_to_bytes(&ping_packet)}, proc(op: ^nbio.Operation) {
-					if op.send.err != nil {
-						log.warnf("Error sending ping to server: %v", op.send.err)
-					}
-					log.debugf("Sent ping")
-				}, SERVER_ENDPOINT, l = g.io_event_loop)
+		//Ping Server Timer
+		{
+			ping_server :: proc(op: ^nbio.Operation, g: ^G) {
+				@(static) ping_packet := sfp.Ping{{sfp.VERSION, sfp.PING_MAGIC}}
+				nbio.send_poly(
+					g.socket,
+					{mem.ptr_to_bytes(&ping_packet)},
+					g,
+					proc(op: ^nbio.Operation, g: ^G) {
+						if op.send.err == nil {
+							when ENABLE_PACKET_STATS {
+								_ = chan.try_send(
+									g.io_to_main,
+									NewPacketStat{.PingAndPong, .Outgoing},
+								)
+							}
+						} else {
+							log.warnf("Error sending ping to server: %v", op.send.err)
+						}
+						log.debugf("Sent ping")
+					},
+					SERVER_ENDPOINT,
+					l = g.io_event_loop,
+				)
 
-			nbio.timeout_poly(5 * time.Second, g, ping_server)
-		}
-		pong_packet: sfp.Pong
-		recv_pong :: proc(op: ^nbio.Operation, g: ^G, pong_packet: ^sfp.Pong) {
-			if op.recv.err == nil {
-				ip := net.Address(pong_packet.external_ip)
-				endpoint := net.Endpoint{ip, auto_cast pong_packet.external_port}
-				_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
-			} else {
-				log.errorf("Error receiving pong packet: %v", op.send.err)
+				nbio.timeout_poly(5 * time.Second, g, ping_server)
 			}
-			nbio.recv_poly2(g.socket, op.recv.bufs, g, pong_packet, recv_pong)
+			nbio.timeout_poly(0, g, ping_server)
 		}
-		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&pong_packet)}, g, &pong_packet, recv_pong)
 
-		nbio.timeout_poly(0, g, ping_server)
+
+		//Listen for Pong packets
+		pong_packet: sfp.Pong
+		{
+			recv_pong :: proc(op: ^nbio.Operation, g: ^G, pong_packet: ^sfp.Pong) {
+				if op.recv.err == nil {
+					if pong_packet.version == sfp.VERSION && pong_packet.magic == sfp.PONG_MAGIC {
+						ip := net.Address(pong_packet.external_ip)
+						endpoint := net.Endpoint{ip, auto_cast pong_packet.external_port}
+
+						_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
+						when ENABLE_PACKET_STATS {
+							_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
+						}
+					} else {
+						log.infof("Received bad pong packet: %v", op.send.err)
+						when ENABLE_PACKET_STATS {
+							_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
+						}
+					}
+				} else {
+					log.warnf("Error receiving pong packet: %v", op.send.err)
+				}
+				nbio.recv_poly2(g.socket, op.recv.bufs, g, pong_packet, recv_pong)
+			}
+			nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&pong_packet)}, g, &pong_packet, recv_pong)
+		}
+		//Listen for FileSendRequest packets
+		file_send_request_packet: sfp.FileSendRequest
+		{
+			recv_file_send_request :: proc(
+				op: ^nbio.Operation,
+				g: ^G,
+				packet: ^sfp.FileSendRequest,
+			) {
+				if op.recv.err == nil {
+					if packet.version == sfp.VERSION {
+						payload: sfp.FileSendRequestPayload
+						if sfp.parse_sfp_file_send_request(g.master_secret_key, &payload, packet) {
+							_ = chan.try_send(g.io_to_main, NewFileSendRequest{payload})
+							when ENABLE_PACKET_STATS {
+								_ = chan.try_send(
+									g.io_to_main,
+									NewPacketStat{.FileSendRequest, .Incoming},
+								)
+							}
+						} else {
+							when ENABLE_PACKET_STATS {
+								_ = chan.try_send(
+									g.io_to_main,
+									NewPacketStat{.FileSendRequest, .Invalid},
+								)
+							}
+
+						}
+					}
+				} else {
+					log.warnf("Error receiving FileSendRequest packet: %v", op.send.err)
+				}
+			}
+		}
+
+
 		for !g.should_quit {
 			err := nbio.tick()
 			if err != nil {
@@ -269,6 +338,8 @@ build_gui :: proc(g: ^G) {
 	im.SetNextWindowSize(g.im_io.DisplaySize)
 	im.Begin("Main", nil, {.NoCollapse, .NoResize, .NoTitleBar})
 	// im.SetWindowFontScale(2)
+
+	//UI Section connection status
 	{
 
 		im.BeginChild("Connection Status", child_flags = {.Borders, .AutoResizeY})
@@ -282,8 +353,42 @@ build_gui :: proc(g: ^G) {
 		} else {
 			im.Text("Not Connected")
 		}
+
 		im.EndChild()
 	}
+	//UI Section Packet Stats
+	when ENABLE_PACKET_STATS {
+		im.BeginChild("Packet Stats", child_flags = {.Borders, .AutoResizeY})
+		im.SeparatorText("Packet Stats")
+		if im.BeginTable("Packet Stats", 4) {
+			im.TableSetupColumn("Type")
+			im.TableSetupColumn("# Incoming Valid Packets")
+			im.TableSetupColumn("# Incoming Invalid Packets")
+			im.TableSetupColumn("# Outgoing Packets")
+			im.TableHeadersRow()
+			for stat, i in g.packet_stats {
+				im.PushIDInt(auto_cast i)
+
+				packet_type := fmt.ctprintf("%v", cast(PacketType)i)
+
+				im.TableNextColumn()
+				im.Text("%s", packet_type)
+				im.TableNextColumn()
+				im.Text("%d", stat.incoming)
+				im.TableNextColumn()
+				im.Text("%d", stat.outgoing)
+				im.TableNextColumn()
+				im.Text("%d", stat.invalid)
+
+				im.PopID()
+			}
+			im.EndTable()
+		}
+		im.EndChild()
+
+	}
+
+	//UI Section: Contact info
 	{
 		im.BeginChild("Your Contact Info", child_flags = {.Borders, .AutoResizeY})
 		im.SeparatorText("Your Contact Info")
@@ -318,6 +423,7 @@ build_gui :: proc(g: ^G) {
 		}
 		im.EndChild()
 	}
+	//UI Section: Contacts
 	{
 		im.BeginChild("Contacts", child_flags = {.Borders, .AutoResizeY})
 		im.SeparatorText("Contacts")
@@ -430,6 +536,7 @@ build_gui :: proc(g: ^G) {
 		im.EndChild()
 
 	}
+	//UI Section: File transfers
 	{
 		human_readable_file_size :: proc(size: i64) -> cstring {
 			result: cstring
@@ -495,6 +602,7 @@ build_gui :: proc(g: ^G) {
 
 	}
 	//TODO enable once we have persistence
+	//UI Section: Enter your name Dialog
 	if false && len(g.my_name) == 0 {
 		if im.BeginPopupModal("Enter your name") {
 			@(static) inputted_name: [sfp.MAX_NAME_SIZE]u8
@@ -515,6 +623,8 @@ build_gui :: proc(g: ^G) {
 		im.OpenPopup("Enter your name")
 
 	}
+
+	////UI Section: "Choose File To Send" dialog
 	if igfd.DisplayDialog(
 		g.igfd_ctx,
 		"Choose File To Send",
@@ -575,10 +685,22 @@ build_gui :: proc(g: ^G) {
 					g: ^G,
 				) {
 
-					nbio.send(
+					nbio.send_poly(
 						g.socket,
 						{mem.ptr_to_bytes(packet)},
-						proc(op: ^nbio.Operation) {},
+						g,
+						proc(op: ^nbio.Operation, g: ^G) {
+							if op.send.err == nil {
+								when ENABLE_PACKET_STATS {
+									_ = chan.try_send(
+										g.io_to_main,
+										NewPacketStat{.FileSendRequest, .Outgoing},
+									)
+								}
+							} else {
+								log.warnf("Error sending file send request: %v", op.send.err)
+							}
+						},
 						SERVER_ENDPOINT,
 					)
 					if transfer.status == .Requested {
@@ -651,6 +773,18 @@ run_ui :: proc() {
 			switch command in received {
 			case NewIPAddress:
 				g.external_ip_address = command.endpoint
+			case NewPacketStat:
+				stat := &g.packet_stats[command.type]
+				switch command.stat {
+				case .Incoming:
+					stat.incoming += 1
+				case .Outgoing:
+					stat.outgoing += 1
+				case .Invalid:
+					stat.invalid += 1
+				}
+			case NewFileSendRequest:
+			//TODO add contact addres to NewFileSendRequest
 			}
 		}
 		imgui_impl_sdlgpu3.NewFrame()
@@ -792,6 +926,8 @@ G :: struct {
 
 	//UI Transient State
 	external_ip_address: net.Endpoint,
+	packet_stats:        [PacketType.Count]PacketStat,
+
 	//Persistent State
 	contacts:            [dynamic; 4096]Contact,
 	transfers:           [dynamic; 4096]Transfer,
@@ -812,11 +948,37 @@ G :: struct {
 	gpu_device:          ^sdl3.GPUDevice,
 }
 
+PacketType :: enum {
+	PingAndPong = 0,
+	FileSendRequest,
+	FileSendRequestAccept,
+	Count,
+}
+
+PacketStat :: struct {
+	incoming, outgoing, invalid: int,
+}
+
 MainThreadCommand :: union {
 	NewIPAddress,
+	NewPacketStat,
+	NewFileSendRequest,
 }
 NewIPAddress :: struct {
 	endpoint: net.Endpoint,
+}
+NewPacketStat :: struct {
+	type: PacketType,
+	stat: enum {
+		Incoming,
+		Outgoing,
+		Invalid,
+	},
+}
+NewFileSendRequest :: struct {
+	request: sfp.FileSendRequestPayload,
+	// sender_address: sfp.Address,
+	// session_id:     sfp.PublicKey,
 }
 
 TLS :: struct {
@@ -836,7 +998,7 @@ LaneContext :: struct {
 
 Contact :: struct {
 	name:    [dynamic; sfp.MAX_NAME_SIZE]byte,
-	address: sfp.Address, //TODO: make real public key
+	address: sfp.Address,
 }
 Transfer :: struct {
 	allocator:                    mem.Allocator,
@@ -846,6 +1008,7 @@ Transfer :: struct {
 	status:                       TransferStatus,
 	file_slices_to_be_transfered: [dynamic]FileSlice,
 	rate:                         f64,
+	session_id:                   sfp.PublicKey,
 }
 FileSlice :: struct {
 	offset: i64,
