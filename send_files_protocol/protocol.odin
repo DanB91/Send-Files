@@ -42,10 +42,7 @@ PacketPayloadHeader :: struct #packed {
 PublicKey :: distinct [x25519.POINT_SIZE]byte
 SecretKey :: distinct [x25519.SCALAR_SIZE]byte
 
-Address :: struct #packed {
-	label:      [16]byte, //This is used by the recipient to derive the secret key from their master secret key
-	public_key: PublicKey,
-}
+Address :: distinct PublicKey
 
 create_key_pair :: proc() -> (pk: PublicKey, sk: SecretKey) {
 	crypto.rand_bytes(sk[:])
@@ -53,64 +50,18 @@ create_key_pair :: proc() -> (pk: PublicKey, sk: SecretKey) {
 	return
 }
 
-create_sfp_address :: proc(
-	master_secret_key: SecretKey,
-) -> (
-	address: Address,
-	secret_key: SecretKey,
-) {
-	master_secret_key := master_secret_key
-
-	crypto.rand_bytes(address.label[:])
-
-	sha_ctx: sha2.Context_256
-	sha2.init_256(&sha_ctx)
-	sha2.update(&sha_ctx, master_secret_key[:])
-	sha2.update(&sha_ctx, address.label[:])
-	sha2.final(&sha_ctx, secret_key[:])
-
-	x25519.scalarmult_basepoint(address.public_key[:], secret_key[:])
+create_sfp_address :: proc(secret_key: SecretKey) -> (address: Address) {
+	secret_key := secret_key
+	x25519.scalarmult_basepoint(address[:], secret_key[:])
 
 	return
 }
-derive_and_validate_secret_key_from_sfp_address :: proc(
-	address: Address,
-	master_secret_key: SecretKey,
-) -> (
-	SecretKey,
-	bool,
-) {
-	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
-	pk: PublicKey
-	x25519.scalarmult_basepoint(pk[:], sk[:])
-	if pk != address.public_key {
-		return {}, false
-	}
-	return sk, true
-}
-derive_secret_key_from_sfp_address :: proc(
-	address: Address,
-	master_secret_key: SecretKey,
-) -> SecretKey {
-	result: SecretKey
 
-	master_secret_key := master_secret_key
-	address := address
-
-	sha_ctx: sha2.Context_256
-	sha2.init_256(&sha_ctx)
-	sha2.update(&sha_ctx, master_secret_key[:])
-	sha2.update(&sha_ctx, address.label[:])
-	sha2.final(&sha_ctx, result[:])
-
-	return result
-}
-
-validate_sfp_address_is_mine :: proc(address: Address, master_secret_key: SecretKey) -> bool {
-	sk := derive_secret_key_from_sfp_address(address, master_secret_key)
-	pk: PublicKey
-	x25519.scalarmult_basepoint(pk[:], sk[:])
-	if pk != address.public_key {
+validate_sfp_address_is_mine :: proc(address: Address, secret_key: SecretKey) -> bool {
+	secret_key := secret_key
+	calculated_address: Address
+	x25519.scalarmult_basepoint(calculated_address[:], secret_key[:])
+	if address != calculated_address {
 		return false
 	}
 	return true
@@ -131,7 +82,7 @@ FileSendRequestPayload :: struct #packed {
 }
 
 
-#assert(size_of(FileSendRequest) == 4 + 4 + 32 + 32 + 16 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 64)
+#assert(size_of(FileSendRequest) == 4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 64)
 
 init_sfp_file_send_request :: proc(
 	ephemeral_secret_key: SecretKey,
@@ -168,11 +119,7 @@ init_sfp_file_send_request :: proc(
 
 		out_packet.target_address = target_address
 
-		x25519.scalarmult(
-			encryption_key[:],
-			ephemeral_secret_key[:],
-			out_packet.target_address.public_key[:],
-		)
+		x25519.scalarmult(encryption_key[:], ephemeral_secret_key[:], out_packet.target_address[:])
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)
@@ -196,17 +143,16 @@ init_sfp_file_send_request :: proc(
 	copy(out_packet.encrypted_payload[:], payload_bytes[:])
 }
 parse_sfp_file_send_request :: proc(
-	master_secret_key: SecretKey,
+	target_secret_key: SecretKey,
 	out_payload: ^FileSendRequestPayload,
 	in_packet: ^FileSendRequest,
 ) -> bool {
+	target_secret_key := target_secret_key
+
 	//calculate the encryption key
 	encryption_key: SecretKey
 	{
-		target_secret_key, valid := derive_and_validate_secret_key_from_sfp_address(
-			in_packet.target_address,
-			master_secret_key,
-		)
+		valid := validate_sfp_address_is_mine(in_packet.target_address, target_secret_key)
 		if !valid {
 			return false
 		}
@@ -249,11 +195,12 @@ FileSendRequestAcceptPayload :: struct #packed {
 	receiver_address: Address, //used for validation purposes
 }
 init_sfp_file_send_request_accept :: proc(
-	receiver_master_secret_key: SecretKey,
+	secret_key: SecretKey,
 	receiver_address: Address,
 	session_id: PublicKey,
 	out_packet: ^FileSendRequestAccept,
 ) {
+	secret_key := secret_key
 	out_packet.version = VERSION
 
 	//set up payload to be encrypted
@@ -267,12 +214,11 @@ init_sfp_file_send_request_accept :: proc(
 	//calculate the encryption key
 	encryption_key: SecretKey
 	{
-		sk := derive_secret_key_from_sfp_address(receiver_address, receiver_master_secret_key)
-		x25519.scalarmult_basepoint(out_packet.session_id[:], sk[:])
+		x25519.scalarmult_basepoint(out_packet.session_id[:], secret_key[:])
 
 
 		session_id := session_id
-		x25519.scalarmult(encryption_key[:], sk[:], session_id[:])
+		x25519.scalarmult(encryption_key[:], secret_key[:], session_id[:])
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)

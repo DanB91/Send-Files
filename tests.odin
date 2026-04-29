@@ -32,9 +32,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 		target_master_secret_key: sfp.SecretKey
 		crypto.rand_bytes(target_master_secret_key[:])
 
-		target_address, target_secret_key := sfp.create_sfp_address(target_master_secret_key)
-
-		// x25519.scalarmult_basepoint(target_address.public_key[:], target_secret_key[:])
+		target_address := sfp.create_sfp_address(target_master_secret_key)
 
 		packet: sfp.FileSendRequest
 
@@ -81,7 +79,7 @@ test_sending_file_send_request :: proc() {
 	@(static) receiver_address_sk: sfp.SecretKey
 	if is_main_thread() {
 		_, receiver_master_sk = sfp.create_key_pair()
-		receiver_address, receiver_address_sk = sfp.create_sfp_address(receiver_master_sk)
+		receiver_address = sfp.create_sfp_address(receiver_master_sk)
 	}
 	lane_sync()
 

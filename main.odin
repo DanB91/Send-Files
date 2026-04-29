@@ -319,10 +319,7 @@ build_gui :: proc(g: ^G) {
 	}
 	ui_contact_text :: proc(contact: Contact) {
 		contact := contact
-		address_string := base64.encode(
-			contact.address.label[:],
-			allocator = context.temp_allocator,
-		)
+		address_string := base64.encode(contact.address[:], allocator = context.temp_allocator)
 		im.PushStyleColor(.Text, 0xFF_00_FF_00)
 		im.Text("%s", cstr(string(contact.name[:])))
 		im.PopStyleColor()
@@ -395,7 +392,7 @@ build_gui :: proc(g: ^G) {
 		im.Text("%s", cstr(g.my_name))
 		im.SameLine()
 		if im.Button("Copy") {
-			address, _ := sfp.create_sfp_address(g.master_secret_key)
+			address := sfp.create_sfp_address(g.master_secret_key)
 			contact_info: ContactSerialized
 			contact_info.address = address
 			contact_info.name_len = auto_cast len(g.my_name)
@@ -403,8 +400,7 @@ build_gui :: proc(g: ^G) {
 
 			crc: u32
 			init_crc32(&crc)
-			digest_crc32(contact_info.address.label[:], &crc)
-			digest_crc32(contact_info.address.public_key[:], &crc)
+			digest_crc32(contact_info.address[:], &crc)
 			digest_crc32(mem.ptr_to_bytes(&contact_info.name_len), &crc)
 			digest_crc32(contact_info.name_store[:], &crc)
 			crc = final_crc32(&crc)
@@ -499,8 +495,7 @@ build_gui :: proc(g: ^G) {
 				contact_info := cast(^ContactSerialized)raw_data(decoded)
 				crc: u32
 				init_crc32(&crc)
-				digest_crc32(contact_info.address.label[:], &crc)
-				digest_crc32(contact_info.address.public_key[:], &crc)
+				digest_crc32(contact_info.address[:], &crc)
 				digest_crc32(mem.ptr_to_bytes(&contact_info.name_len), &crc)
 				digest_crc32(contact_info.name_store[:], &crc)
 				crc = final_crc32(&crc)
