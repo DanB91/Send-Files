@@ -31,7 +31,7 @@ Pong :: struct #packed {
 //unencrypted header containing only necessary information needed for decryption
 PacketHeader :: struct #packed {
 	version:          i32,
-	session_id:       PublicKey,
+	session_id:       SessionID,
 	encryption_tag:   [chacha20poly1305.TAG_SIZE]byte,
 	encryption_nonce: [chacha20poly1305.XIV_SIZE]byte,
 }
@@ -43,10 +43,18 @@ PublicKey :: distinct [x25519.POINT_SIZE]byte
 SecretKey :: distinct [x25519.SCALAR_SIZE]byte
 
 Address :: distinct PublicKey
+SessionID :: distinct PublicKey
 
-create_key_pair :: proc() -> (pk: PublicKey, sk: SecretKey) {
-	crypto.rand_bytes(sk[:])
-	x25519.scalarmult_basepoint(pk[:], sk[:])
+create_key_pair :: proc() -> (public_ky: PublicKey, secret_key: SecretKey) {
+	crypto.rand_bytes(secret_key[:])
+	x25519.scalarmult_basepoint(public_ky[:], secret_key[:])
+	return
+}
+
+create_session_id :: proc() -> (session_id: SessionID, secret_key: SecretKey) {
+	pk, sk := create_key_pair()
+	session_id = auto_cast pk
+	secret_key = sk
 	return
 }
 
@@ -86,7 +94,7 @@ FileSendRequestPayload :: struct #packed {
 
 init_sfp_file_send_request :: proc(
 	ephemeral_secret_key: SecretKey,
-	session_id: PublicKey,
+	session_id: SessionID,
 	target_address: Address,
 	file_size: i64,
 	file_name: string,
@@ -197,7 +205,7 @@ FileSendRequestAcceptPayload :: struct #packed {
 init_sfp_file_send_request_accept :: proc(
 	secret_key: SecretKey,
 	receiver_address: Address,
-	session_id: PublicKey,
+	session_id: SessionID,
 	out_packet: ^FileSendRequestAccept,
 ) {
 	secret_key := secret_key

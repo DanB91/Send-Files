@@ -27,12 +27,13 @@ run_tests :: proc() {
 
 test_constructing_parsing_file_send_request_packet :: proc() {
 	if is_main_thread() {
-		session_id, sender_ephemeral_secret_key := sfp.create_key_pair()
+		session_id, sender_ephemeral_secret_key := sfp.create_session_id()
 
 		target_master_secret_key: sfp.SecretKey
 		crypto.rand_bytes(target_master_secret_key[:])
 
 		target_address := sfp.create_sfp_address(target_master_secret_key)
+
 
 		packet: sfp.FileSendRequest
 
@@ -87,11 +88,11 @@ test_sending_file_send_request :: proc() {
 	if is_main_thread() {
 		nbio.acquire_thread_event_loop()
 		defer nbio.release_thread_event_loop()
-		ephemeral_pk, ephemperal_sk := sfp.create_key_pair()
+		session_id, ephemperal_sk := sfp.create_session_id()
 		file_send_request_packet: sfp.FileSendRequest
 		sfp.init_sfp_file_send_request(
 			ephemperal_sk,
-			ephemeral_pk,
+			session_id,
 			receiver_address,
 			FILE_SIZE,
 			FILE_NAME,

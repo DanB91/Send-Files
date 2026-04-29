@@ -632,7 +632,8 @@ build_gui :: proc(g: ^G) {
 			file_name := filepath.base(path)
 			file_info, err := os.stat(path, context.temp_allocator)
 			if err == nil {
-				session_id, sk := sfp.create_key_pair()
+				pk, sk := sfp.create_key_pair()
+				session_id: sfp.SessionID = auto_cast pk
 				contact := cast(^Contact)igfd.GetUserDatas(g.igfd_ctx)
 
 				append(&g.transfers, Transfer{})
