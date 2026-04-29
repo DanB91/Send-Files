@@ -162,7 +162,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 		//init placeholder values.  TODO: remove after we implement persistance
 		g.my_name = "Dan"
-		_, g.master_secret_key = sfp.create_key_pair()
+		g.my_address, g.my_secret_key = sfp.create_address()
 
 		io_to_main, err := chan.create(chan.Chan(MainThreadCommand), 1024, context.allocator)
 		ensure(err == nil)
@@ -276,8 +276,11 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 				if op.recv.err == nil {
 					if packet.version == sfp.VERSION {
 						payload: sfp.FileSendRequestPayload
-						if sfp.parse_sfp_file_send_request(g.master_secret_key, &payload, packet) {
-							_ = chan.try_send(g.io_to_main, NewFileSendRequest{payload})
+						if sfp.parse_sfp_file_send_request(g.my_secret_key, &payload, packet) {
+							_ = chan.try_send(
+								g.io_to_main,
+								NewFileSendRequest{payload, packet.session_id},
+							)
 							when ENABLE_PACKET_STATS {
 								_ = chan.try_send(
 									g.io_to_main,
@@ -360,8 +363,8 @@ build_gui :: proc(g: ^G) {
 		if im.BeginTable("Packet Stats", 4) {
 			im.TableSetupColumn("Type")
 			im.TableSetupColumn("# Incoming Valid Packets")
-			im.TableSetupColumn("# Incoming Invalid Packets")
 			im.TableSetupColumn("# Outgoing Packets")
+			im.TableSetupColumn("# Incoming Invalid Packets")
 			im.TableHeadersRow()
 			for stat, i in g.packet_stats {
 				im.PushIDInt(auto_cast i)
@@ -392,9 +395,8 @@ build_gui :: proc(g: ^G) {
 		im.Text("%s", cstr(g.my_name))
 		im.SameLine()
 		if im.Button("Copy") {
-			address := sfp.create_sfp_address(g.master_secret_key)
 			contact_info: ContactSerialized
-			contact_info.address = address
+			contact_info.address = g.my_address
 			contact_info.name_len = auto_cast len(g.my_name)
 			copy(contact_info.name_store[:], g.my_name[:])
 
@@ -635,31 +637,14 @@ build_gui :: proc(g: ^G) {
 				session_id, sk := sfp.create_session_id()
 				contact := cast(^Contact)igfd.GetUserDatas(g.igfd_ctx)
 
-				append(&g.transfers, Transfer{})
-
-				transfer := &g.transfers[len(g.transfers) - 1]
-				{
-					transfer_arena: mem.Arena
-					mem.arena_init(&transfer_arena, make([]byte, 512 * 1024, context.allocator))
-					transfer_allocator := mem.arena_allocator(&transfer_arena)
-
-					file_slices_to_be_transfered := make([dynamic]FileSlice, transfer_allocator)
-					append(&file_slices_to_be_transfered, FileSlice{0, file_info.size})
-
-
-					transfer^ = Transfer {
-						allocator                    = transfer_allocator,
-						file_name                    = strings.clone(
-							file_name,
-							transfer_allocator,
-						),
-						file_size                    = file_info.size,
-						counter_party                = contact^,
-						status                       = .Requested,
-						file_slices_to_be_transfered = file_slices_to_be_transfered,
-						rate                         = 0,
-					}
-				}
+				transfer := create_transfer(
+					file_name,
+					file_info.size,
+					contact^,
+					.OutgoingRequested,
+					session_id,
+				)
+				append(&g.transfers, transfer)
 
 				packet := new(sfp.FileSendRequest, transfer.allocator)
 				sfp.init_sfp_file_send_request(
@@ -668,6 +653,7 @@ build_gui :: proc(g: ^G) {
 					contact.address,
 					file_info.size,
 					file_name,
+					g.my_address,
 					g.my_name,
 					g.external_ip_address.address.(net.IP4_Address),
 					auto_cast g.external_ip_address.port,
@@ -698,7 +684,7 @@ build_gui :: proc(g: ^G) {
 						},
 						SERVER_ENDPOINT,
 					)
-					if transfer.status == .Requested {
+					if transfer.status == .OutgoingRequested {
 						nbio.timeout_poly3(
 							5 * time.Second,
 							packet,
@@ -779,7 +765,17 @@ run_ui :: proc() {
 					stat.invalid += 1
 				}
 			case NewFileSendRequest:
-			//TODO add contact addres to NewFileSendRequest
+				//TODO add contact addres to NewFileSendRequest
+				request := command.request
+				counter_party := Contact{request.requester_name, request.requester_address}
+				transfer := create_transfer(
+					string(request.file_name[:]),
+					request.file_size,
+					counter_party,
+					.IncomingRequested,
+					command.session_id,
+				)
+				append(&g.transfers, transfer)
 			}
 		}
 		imgui_impl_sdlgpu3.NewFrame()
@@ -925,9 +921,10 @@ G :: struct {
 
 	//Persistent State
 	contacts:            [dynamic; 4096]Contact,
-	transfers:           [dynamic; 4096]Transfer,
+	transfers:           [dynamic; 4096]^Transfer,
 	my_name:             string,
-	master_secret_key:   sfp.SecretKey,
+	my_secret_key:       sfp.SecretKey,
+	my_address:          sfp.Address,
 
 	//IO
 	io_event_loop:       ^nbio.Event_Loop,
@@ -971,9 +968,8 @@ NewPacketStat :: struct {
 	},
 }
 NewFileSendRequest :: struct {
-	request: sfp.FileSendRequestPayload,
-	// sender_address: sfp.Address,
-	// session_id:     sfp.PublicKey,
+	request:    sfp.FileSendRequestPayload,
+	session_id: sfp.SessionID,
 }
 
 TLS :: struct {
@@ -995,6 +991,37 @@ Contact :: struct {
 	name:    [dynamic; sfp.MAX_NAME_SIZE]byte,
 	address: sfp.Address,
 }
+create_transfer :: proc(
+	file_name: string,
+	file_size: i64,
+	contact: Contact,
+	status: TransferStatus,
+	session_id: sfp.SessionID,
+) -> ^Transfer {
+	transfer_arena: mem.Arena
+	mem.arena_init(&transfer_arena, make([]byte, 512 * 1024, context.allocator))
+	transfer_allocator := mem.arena_allocator(&transfer_arena)
+
+	file_slices_to_be_transfered := make([dynamic]FileSlice, transfer_allocator)
+	append(&file_slices_to_be_transfered, FileSlice{0, file_size})
+
+
+	transfer_value := Transfer {
+		transfer_allocator,
+		strings.clone(file_name, transfer_allocator),
+		file_size,
+		contact,
+		status,
+		file_slices_to_be_transfered,
+		0,
+		session_id,
+	}
+
+	transfer := new(Transfer, transfer_allocator)
+	transfer^ = transfer_value
+
+	return transfer
+}
 Transfer :: struct {
 	allocator:                    mem.Allocator,
 	file_name:                    string,
@@ -1003,17 +1030,20 @@ Transfer :: struct {
 	status:                       TransferStatus,
 	file_slices_to_be_transfered: [dynamic]FileSlice,
 	rate:                         f64,
-	session_id:                   sfp.PublicKey,
+	session_id:                   sfp.SessionID,
 }
 FileSlice :: struct {
 	offset: i64,
 	len:    i64,
 }
 TransferStatus :: enum {
-	NotStarted,
-	Requested,
+	Invalid,
+	OutgoingRequested,
+	OutgoingTransferring,
+	IncomingRequested,
+	IncomingAccepted,
+	IncomingTransferring,
 	//...
-	Transferring,
 }
 
 //Send Files Protocol (SFP) stuff

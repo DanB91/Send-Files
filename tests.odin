@@ -28,11 +28,7 @@ run_tests :: proc() {
 test_constructing_parsing_file_send_request_packet :: proc() {
 	if is_main_thread() {
 		session_id, sender_ephemeral_secret_key := sfp.create_session_id()
-
-		target_master_secret_key: sfp.SecretKey
-		crypto.rand_bytes(target_master_secret_key[:])
-
-		target_address := sfp.create_sfp_address(target_master_secret_key)
+		target_address, target_master_secret_key := sfp.create_address()
 
 
 		packet: sfp.FileSendRequest
@@ -49,6 +45,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 			target_address,
 			FILE_SIZE,
 			FILE_NAME,
+			target_address,
 			REQUESTER_NAME,
 			IP_ADDR,
 			PORT,
@@ -79,8 +76,7 @@ test_sending_file_send_request :: proc() {
 	@(static) receiver_address: sfp.Address
 	@(static) receiver_address_sk: sfp.SecretKey
 	if is_main_thread() {
-		_, receiver_master_sk = sfp.create_key_pair()
-		receiver_address = sfp.create_sfp_address(receiver_master_sk)
+		receiver_address, receiver_master_sk = sfp.create_address()
 	}
 	lane_sync()
 
@@ -96,6 +92,7 @@ test_sending_file_send_request :: proc() {
 			receiver_address,
 			FILE_SIZE,
 			FILE_NAME,
+			receiver_address,
 			REQUESTER_NAME,
 			IP_ADDR,
 			PORT,

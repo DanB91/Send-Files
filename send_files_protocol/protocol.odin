@@ -45,9 +45,9 @@ SecretKey :: distinct [x25519.SCALAR_SIZE]byte
 Address :: distinct PublicKey
 SessionID :: distinct PublicKey
 
-create_key_pair :: proc() -> (public_ky: PublicKey, secret_key: SecretKey) {
+create_key_pair :: proc() -> (public_key: PublicKey, secret_key: SecretKey) {
 	crypto.rand_bytes(secret_key[:])
-	x25519.scalarmult_basepoint(public_ky[:], secret_key[:])
+	x25519.scalarmult_basepoint(public_key[:], secret_key[:])
 	return
 }
 
@@ -58,12 +58,13 @@ create_session_id :: proc() -> (session_id: SessionID, secret_key: SecretKey) {
 	return
 }
 
-create_sfp_address :: proc(secret_key: SecretKey) -> (address: Address) {
-	secret_key := secret_key
-	x25519.scalarmult_basepoint(address[:], secret_key[:])
-
+create_address :: proc() -> (address: Address, secret_key: SecretKey) {
+	pk, sk := create_key_pair()
+	address = auto_cast pk
+	secret_key = sk
 	return
 }
+
 
 validate_sfp_address_is_mine :: proc(address: Address, secret_key: SecretKey) -> bool {
 	secret_key := secret_key
@@ -81,16 +82,20 @@ FileSendRequest :: struct #packed {
 	encrypted_payload: [size_of(FileSendRequestPayload)]byte,
 }
 FileSendRequestPayload :: struct #packed {
-	using header:     PacketPayloadHeader,
-	reply_ip_address: nbio.IP4_Address,
-	reply_port:       u16,
-	file_size:        i64,
-	file_name:        [dynamic; MAX_FILE_NAME_SIZE]byte,
-	requester_name:   [dynamic; MAX_NAME_SIZE]byte,
+	using header:      PacketPayloadHeader,
+	reply_ip_address:  nbio.IP4_Address,
+	reply_port:        u16,
+	file_size:         i64,
+	file_name:         [dynamic; MAX_FILE_NAME_SIZE]byte,
+	requester_name:    [dynamic; MAX_NAME_SIZE]byte,
+	requester_address: Address,
 }
 
 
-#assert(size_of(FileSendRequest) == 4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + 512 + 8 + 64)
+#assert(
+	size_of(FileSendRequest) ==
+	4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + MAX_FILE_NAME_SIZE + 8 + MAX_NAME_SIZE + 32,
+)
 
 init_sfp_file_send_request :: proc(
 	ephemeral_secret_key: SecretKey,
@@ -98,6 +103,7 @@ init_sfp_file_send_request :: proc(
 	target_address: Address,
 	file_size: i64,
 	file_name: string,
+	requester_address: Address,
 	requester_name: string,
 	reply_ip_address: nbio.IP4_Address,
 	reply_port: u16,
@@ -116,6 +122,7 @@ init_sfp_file_send_request :: proc(
 		copy(payload.requester_name[:], requester_name[:])
 		payload.reply_ip_address = reply_ip_address
 		payload.reply_port = reply_port
+		payload.requester_address = requester_address
 	}
 
 
