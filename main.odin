@@ -211,7 +211,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 		//Ping Server Timer
 		{
 			ping_server :: proc(op: ^nbio.Operation, g: ^G) {
-				@(static) ping_packet := sfp.Ping{{sfp.VERSION, sfp.PING_MAGIC}}
+				@(static) ping_packet := sfp.Ping{{sfp.VERSION, .Ping}}
 				nbio.send_poly(
 					g.socket,
 					{mem.ptr_to_bytes(&ping_packet)},
@@ -240,46 +240,56 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 
 		//Listen for Pong packets
-		pong_packet: sfp.Pong
-		{
-			recv_pong :: proc(op: ^nbio.Operation, g: ^G, pong_packet: ^sfp.Pong) {
-				if op.recv.err == nil {
-					if pong_packet.version == sfp.VERSION && pong_packet.magic == sfp.PONG_MAGIC {
-						ip := net.Address(pong_packet.external_ip)
-						endpoint := net.Endpoint{ip, auto_cast pong_packet.external_port}
+		Packets :: struct #raw_union {
+			using header:      sfp.PacketHeader,
+			pong:              sfp.Pong,
+			file_send_request: sfp.FileSendRequest,
+		}
+		PacketBuffer :: struct #raw_union {
+			using packets: Packets,
+			bytes:         [size_of(Packets)]byte,
+		}
+		packet: PacketBuffer
+		recv_packet :: proc(op: ^nbio.Operation, g: ^G, packet: ^PacketBuffer) {
+			if op.recv.err == nil {
+				if packet.version == sfp.VERSION {
+					cursor := size_of(sfp.PacketHeader)
+					switch packet.type {
+					case .Pong:
+						size := size_of(sfp.Ping) - size_of(sfp.PacketHeader)
+						bytes_read, _, err := net.recv_udp(
+							g.socket,
+							packet.bytes[cursor:cursor + size],
+						)
+						//TODO: better checks
+						assert(err != nil)
+						assert(bytes_read == size)
+						ip := net.Address(packet.pong.external_ip)
+						endpoint := net.Endpoint{ip, auto_cast packet.pong.external_port}
 
 						_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
 						when ENABLE_PACKET_STATS {
 							_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
 						}
-					} else {
-						log.infof("Received bad pong packet: %v", op.send.err)
-						when ENABLE_PACKET_STATS {
-							_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
-						}
-					}
-				} else {
-					log.warnf("Error receiving pong packet: %v", op.send.err)
-				}
-				nbio.recv_poly2(g.socket, op.recv.bufs, g, pong_packet, recv_pong)
-			}
-			nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&pong_packet)}, g, &pong_packet, recv_pong)
-		}
-		//Listen for FileSendRequest packets
-		file_send_request_packet: sfp.FileSendRequest
-		{
-			recv_file_send_request :: proc(
-				op: ^nbio.Operation,
-				g: ^G,
-				packet: ^sfp.FileSendRequest,
-			) {
-				if op.recv.err == nil {
-					if packet.version == sfp.VERSION {
+					case .Encrypted:
 						payload: sfp.FileSendRequestPayload
-						if sfp.parse_sfp_file_send_request(g.my_secret_key, &payload, packet) {
+						file_send_request := &packet.file_send_request
+						size := size_of(sfp.FileSendRequest) - size_of(sfp.PacketHeader)
+						bytes_read, _, err := net.recv_udp(
+							g.socket,
+							packet.bytes[cursor:cursor + size],
+						)
+						//TODO: better checks
+						assert(err != nil)
+						assert(bytes_read == size)
+						if sfp.parse_sfp_file_send_request(
+							g.my_secret_key,
+							&payload,
+							file_send_request,
+						) {
 							_ = chan.try_send(
 								g.io_to_main,
-								NewFileSendRequest{payload, packet.session_id},
+								NewFileSendRequest{payload, file_send_request.session_id},
 							)
 							when ENABLE_PACKET_STATS {
 								_ = chan.try_send(
@@ -296,12 +306,22 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 							}
 
 						}
+					case .Ping:
+						log.warnf("Recevied unexpected ping packet!")
+
 					}
 				} else {
-					log.warnf("Error receiving FileSendRequest packet: %v", op.send.err)
+					log.infof("Received packet with invalid version: %v", packet.version)
+					when ENABLE_PACKET_STATS {
+						_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
+					}
 				}
+			} else {
+				log.warnf("Error receiving pong packet: %v", op.send.err)
 			}
+			nbio.recv_poly2(g.socket, op.recv.bufs, g, packet, recv_packet)
 		}
+		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&packet.header)}, g, &packet, recv_packet)
 
 
 		for !g.should_quit {

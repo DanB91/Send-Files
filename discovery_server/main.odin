@@ -149,7 +149,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 			if err == nil {
 				switch bytes_read {
 				case size_of(buf.ping):
-					if buf.ping.magic == sfp.PING_MAGIC {
+					if buf.ping.type == .Ping {
 						switch addr in source.address {
 						case nbio.IP4_Address:
 							id := lane_id_for_ip_source(source, g)
@@ -163,7 +163,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 						case nbio.IP6_Address:
 						}
 					} else {
-						log.infof("Received bad ping packet with contents: %X", buf.ping.magic)
+						log.infof("Received bad ping packet of type: %v", buf.ping.type)
 					}
 				case size_of(buf.send_request):
 					for c, id in g.file_send_request_packet_channels {
@@ -181,7 +181,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 					log.infof("Received unexpected number of bytes: %v", bytes_read)
 				}
 			} else {
-				log.infof("Error in socket: %v", err)
+				log.warnf("Error in socket: %v", err)
 			}
 		}
 
@@ -211,7 +211,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 				if ping_source, ok := chan.try_recv(ping_channel); ok {
 					lru.set(&known_clients, ping_source, struct{}{})
 					pong_packet := sfp.Pong {
-						{sfp.VERSION, sfp.PONG_MAGIC},
+						{sfp.VERSION, .Pong},
 						ping_source.address.(net.IP4_Address),
 						auto_cast ping_source.port,
 					}

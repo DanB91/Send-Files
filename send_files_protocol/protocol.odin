@@ -10,30 +10,34 @@ VERSION :: i32(0)
 MAX_NAME_SIZE :: 64
 MAX_FILE_NAME_SIZE :: 512
 
-DiscoveryServerHeader :: struct #packed {
+PacketHeader :: struct #packed {
 	version: i32,
-	magic:   u32,
+	type:    enum (u32) {
+		Ping,
+		Pong,
+		Encrypted,
+	},
 }
 
 PING_MAGIC :: 0x676E6970 //ASCII for "ping"
 
 Ping :: struct #packed {
-	using header: DiscoveryServerHeader,
+	using header: PacketHeader,
 }
 PONG_MAGIC :: 0x676E6F70 //ASCII for "pong"
 Pong :: struct #packed {
-	using header:  DiscoveryServerHeader,
+	using header:  PacketHeader,
 	external_ip:   nbio.IP4_Address,
 	external_port: u16,
 }
 
 
 //unencrypted header containing only necessary information needed for decryption
-PacketHeader :: struct #packed {
-	version:          i32,
-	session_id:       SessionID,
-	encryption_tag:   [chacha20poly1305.TAG_SIZE]byte,
-	encryption_nonce: [chacha20poly1305.XIV_SIZE]byte,
+EncryptionHeader :: struct #packed {
+	using packet_header: PacketHeader,
+	session_id:          SessionID,
+	encryption_tag:      [chacha20poly1305.TAG_SIZE]byte,
+	encryption_nonce:    [chacha20poly1305.XIV_SIZE]byte,
 }
 //All encrypted payloads must start with this header
 PacketPayloadHeader :: struct #packed {
@@ -77,24 +81,24 @@ validate_sfp_address_is_mine :: proc(address: Address, secret_key: SecretKey) ->
 }
 
 FileSendRequest :: struct #packed {
-	using header:      PacketHeader,
-	target_address:    Address,
-	encrypted_payload: [size_of(FileSendRequestPayload)]byte,
+	using encryption_header: EncryptionHeader,
+	target_address:          Address,
+	encrypted_payload:       [size_of(FileSendRequestPayload)]byte,
 }
 FileSendRequestPayload :: struct #packed {
-	using header:      PacketPayloadHeader,
-	reply_ip_address:  nbio.IP4_Address,
-	reply_port:        u16,
-	file_size:         i64,
-	file_name:         [dynamic; MAX_FILE_NAME_SIZE]byte,
-	requester_name:    [dynamic; MAX_NAME_SIZE]byte,
-	requester_address: Address,
+	using payload_header: PacketPayloadHeader,
+	reply_ip_address:     nbio.IP4_Address,
+	reply_port:           u16,
+	file_size:            i64,
+	file_name:            [dynamic; MAX_FILE_NAME_SIZE]byte,
+	requester_name:       [dynamic; MAX_NAME_SIZE]byte,
+	requester_address:    Address,
 }
 
 
 #assert(
 	size_of(FileSendRequest) ==
-	4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + MAX_FILE_NAME_SIZE + 8 + MAX_NAME_SIZE + 32,
+	4 + 4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + MAX_FILE_NAME_SIZE + 8 + MAX_NAME_SIZE + 32,
 )
 
 init_sfp_file_send_request :: proc(
@@ -202,7 +206,7 @@ parse_sfp_file_send_request :: proc(
 }
 
 FileSendRequestAccept :: struct #packed {
-	using header:      PacketHeader,
+	using header:      EncryptionHeader,
 	encrypted_payload: [size_of(FileSendRequestAcceptPayload)]byte,
 }
 FileSendRequestAcceptPayload :: struct #packed {
@@ -261,7 +265,7 @@ init_sfp_file_send_request_accept :: proc(
 _MAX_DATA_CHUNK_SIZE :: 16 * 1024
 
 FileDataPacket :: struct #packed {
-	using header: PacketHeader,
+	using header: EncryptionHeader,
 	payload:      [size_of(FileDataPayload)]byte,
 }
 // #assert(size_of(FileDataPacket) == 4 + 4 + 32 + 24 + 16 + 8 + 8 + 16 * 1024)
