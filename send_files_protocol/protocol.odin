@@ -11,26 +11,32 @@ MAX_NAME_SIZE :: 64
 MAX_FILE_NAME_SIZE :: 512
 
 PacketHeader :: struct #packed {
+	size:    i32,
 	version: i32,
-	type:    enum (u32) {
+	type:    enum (i32) {
 		Ping,
 		Pong,
 		Encrypted,
 	},
 }
 
-PING_MAGIC :: 0x676E6970 //ASCII for "ping"
 
 Ping :: struct #packed {
 	using header: PacketHeader,
 }
-PONG_MAGIC :: 0x676E6F70 //ASCII for "pong"
+create_ping_packet :: proc() -> Ping {
+	result := Ping{{size_of(Ping), VERSION, .Ping}}
+	return result
+}
 Pong :: struct #packed {
 	using header:  PacketHeader,
 	external_ip:   nbio.IP4_Address,
 	external_port: u16,
 }
-
+create_pong_packet :: proc(external_ip: nbio.IP4_Address, external_port: u16) -> Pong {
+	result := Pong{{size_of(Pong), VERSION, .Pong}, external_ip, external_port}
+	return result
+}
 
 //unencrypted header containing only necessary information needed for decryption
 EncryptionHeader :: struct #packed {
@@ -98,7 +104,22 @@ FileSendRequestPayload :: struct #packed {
 
 #assert(
 	size_of(FileSendRequest) ==
-	4 + 4 + 4 + 32 + 32 + 16 + 24 + 4 + 2 + 8 + 8 + MAX_FILE_NAME_SIZE + 8 + MAX_NAME_SIZE + 32,
+	4 +
+		4 +
+		4 +
+		4 +
+		32 +
+		32 +
+		16 +
+		24 +
+		4 +
+		2 +
+		8 +
+		8 +
+		MAX_FILE_NAME_SIZE +
+		8 +
+		MAX_NAME_SIZE +
+		32,
 )
 
 init_sfp_file_send_request :: proc(
@@ -114,6 +135,7 @@ init_sfp_file_send_request :: proc(
 	out_packet: ^FileSendRequest,
 ) {
 	out_packet.version = VERSION
+	out_packet.packet_header.size = size_of(FileSendRequest)
 
 	//set up payload to be encrypted
 	payload: FileSendRequestPayload

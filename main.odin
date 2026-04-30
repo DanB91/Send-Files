@@ -211,7 +211,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 		//Ping Server Timer
 		{
 			ping_server :: proc(op: ^nbio.Operation, g: ^G) {
-				@(static) ping_packet := sfp.Ping{{sfp.VERSION, .Ping}}
+				@(static) ping_packet := sfp.Ping{{size_of(sfp.Ping), sfp.VERSION, .Ping}}
 				nbio.send_poly(
 					g.socket,
 					{mem.ptr_to_bytes(&ping_packet)},
@@ -241,20 +241,21 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 		//Listen for Pong packets
 		Packets :: struct #raw_union {
-			using header:      sfp.PacketHeader,
+			header:            sfp.PacketHeader,
 			pong:              sfp.Pong,
 			file_send_request: sfp.FileSendRequest,
 		}
 		PacketBuffer :: struct #raw_union {
 			using packets: Packets,
+			size:          i32,
 			bytes:         [size_of(Packets)]byte,
 		}
 		packet: PacketBuffer
 		recv_packet :: proc(op: ^nbio.Operation, g: ^G, packet: ^PacketBuffer) {
 			if op.recv.err == nil {
-				if packet.version == sfp.VERSION {
+				if packet.header.version == sfp.VERSION {
 					cursor := size_of(sfp.PacketHeader)
-					switch packet.type {
+					switch packet.header.type {
 					case .Pong:
 						size := size_of(sfp.Ping) - size_of(sfp.PacketHeader)
 						bytes_read, _, err := net.recv_udp(
@@ -311,7 +312,7 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 					}
 				} else {
-					log.infof("Received packet with invalid version: %v", packet.version)
+					log.infof("Received packet with invalid version: %v", packet.header.version)
 					when ENABLE_PACKET_STATS {
 						_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
 					}
@@ -319,9 +320,15 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 			} else {
 				log.warnf("Error receiving pong packet: %v", op.send.err)
 			}
-			nbio.recv_poly2(g.socket, op.recv.bufs, g, packet, recv_packet)
+			nbio.recv_poly2(g.socket, op.recv.bufs, g, packet, recv_packet_size)
 		}
-		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&packet.header)}, g, &packet, recv_packet)
+
+		recv_packet_size :: proc(op: ^nbio.Operation, g: ^G, packet: ^PacketBuffer) {
+			cursor: i32 = size_of(packet.size)
+			size := packet.size
+			nbio.recv_poly2(g.socket, {packet.bytes[cursor:cursor + size]}, g, packet, recv_packet)
+		}
+		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&packet.size)}, g, &packet, recv_packet)
 
 
 		for !g.should_quit {

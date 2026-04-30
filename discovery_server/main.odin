@@ -210,11 +210,10 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 				keep_going = false
 				if ping_source, ok := chan.try_recv(ping_channel); ok {
 					lru.set(&known_clients, ping_source, struct{}{})
-					pong_packet := sfp.Pong {
-						{sfp.VERSION, .Pong},
+					pong_packet := sfp.create_pong_packet(
 						ping_source.address.(net.IP4_Address),
 						auto_cast ping_source.port,
-					}
+					)
 					log.infof("Sent pong to %v", ping_source)
 					nbio.send(
 						g.socket,
