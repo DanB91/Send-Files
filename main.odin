@@ -239,7 +239,6 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 		}
 
 
-		//Listen for Pong packets
 		Packets :: struct #raw_union {
 			header:            sfp.PacketHeader,
 			pong:              sfp.Pong,
@@ -250,95 +249,104 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 			size:          i32,
 			bytes:         [size_of(Packets)]byte,
 		}
+
+
 		packet: PacketBuffer
-		recv_packet :: proc(op: ^nbio.Operation, g: ^G, packet: ^PacketBuffer) {
-			if op.recv.err == nil {
-				if packet.header.version == sfp.VERSION {
-					cursor := size_of(sfp.PacketHeader)
-					switch packet.header.type {
-					case .Pong:
-						size := size_of(sfp.Ping) - size_of(sfp.PacketHeader)
-						bytes_read, _, err := net.recv_udp(
-							g.socket,
-							packet.bytes[cursor:cursor + size],
-						)
-						//TODO: better checks
-						assert(err != nil)
-						assert(bytes_read == size)
-						ip := net.Address(packet.pong.external_ip)
-						endpoint := net.Endpoint{ip, auto_cast packet.pong.external_port}
-
-						_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
-						when ENABLE_PACKET_STATS {
-							_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
-						}
-					case .Encrypted:
-						payload: sfp.FileSendRequestPayload
-						file_send_request := &packet.file_send_request
-						size := size_of(sfp.FileSendRequest) - size_of(sfp.PacketHeader)
-						bytes_read, _, err := net.recv_udp(
-							g.socket,
-							packet.bytes[cursor:cursor + size],
-						)
-						//TODO: better checks
-						assert(err != nil)
-						assert(bytes_read == size)
-						if sfp.parse_sfp_file_send_request(
-							g.my_secret_key,
-							&payload,
-							file_send_request,
-						) {
-							_ = chan.try_send(
-								g.io_to_main,
-								NewFileSendRequest{payload, file_send_request.session_id},
-							)
-							when ENABLE_PACKET_STATS {
-								_ = chan.try_send(
-									g.io_to_main,
-									NewPacketStat{.FileSendRequest, .Incoming},
-								)
-							}
-						} else {
-							when ENABLE_PACKET_STATS {
-								_ = chan.try_send(
-									g.io_to_main,
-									NewPacketStat{.FileSendRequest, .Invalid},
-								)
-							}
-
-						}
-					case .Ping:
-						log.warnf("Recevied unexpected ping packet!")
-
-					}
-				} else {
-					log.infof("Received packet with invalid version: %v", packet.header.version)
-					when ENABLE_PACKET_STATS {
-						_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
-					}
-				}
+		incoming_data_buffer: bytes.Buffer
+		// bytes.buffer_init(&incoming_data_buffer, make([]byte, 2 * 1024 * 1024, context.allocator))
+		recv_data :: proc(op: ^nbio.Operation, g: ^G, buffer: ^bytes.Buffer) {
+			recv := op.recv
+			if recv.err == nil {
+				bytes.buffer_write(buffer, op.recv.bufs[0][0:recv.received])
+				log.infof(
+					"Received %v bytes. Buffer len: %v, cap: %v",
+					recv.received,
+					bytes.buffer_length(buffer),
+					bytes.buffer_capacity(buffer),
+				)
 			} else {
-				log.warnf("Error receiving pong packet: %v", op.send.err)
+				log.errorf("Error receiving data: %v", recv.err)
 			}
-			nbio.recv_poly2(g.socket, op.recv.bufs, g, packet, recv_packet_size)
+			nbio.recv_poly2(g.socket, recv.bufs, g, buffer, recv_data)
 		}
-
-		recv_packet_size :: proc(op: ^nbio.Operation, g: ^G, packet: ^PacketBuffer) {
-			cursor: i32 = size_of(packet.size)
-			size := packet.size
-			nbio.recv_poly2(g.socket, {packet.bytes[cursor:cursor + size]}, g, packet, recv_packet)
-		}
-		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&packet.size)}, g, &packet, recv_packet)
+		nbio.recv_poly2(g.socket, {mem.ptr_to_bytes(&packet)}, g, &incoming_data_buffer, recv_data)
 
 
 		for !g.should_quit {
 			err := nbio.tick()
+			try_process_received_data(&incoming_data_buffer, g)
 			if err != nil {
 				fmt.printfln("IO Error: %v", err)
 			}
 		}
 	}
 	lane_sync()
+}
+try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
+	packet_header: struct #raw_union {
+		header: sfp.PacketHeader,
+		bytes:  [size_of(sfp.PacketHeader)]byte,
+	}
+
+	if (bytes.buffer_length(received_data) < size_of(packet_header)) {
+		return
+	}
+	copy(packet_header.bytes[:], received_data.buf[received_data.off:])
+	if packet_header.header.size > auto_cast bytes.buffer_length(received_data) {
+		return
+	}
+	if packet_header.header.version == sfp.VERSION {
+		cursor := size_of(sfp.PacketHeader)
+		switch packet_header.header.type {
+		case .Pong:
+			if bytes.buffer_length(received_data) < size_of(sfp.Pong) {
+				return
+			}
+			pong := cast(^sfp.Pong)raw_data(bytes.buffer_next(received_data, size_of(sfp.Pong)))
+
+			ip := net.Address(pong.external_ip)
+			endpoint := net.Endpoint{ip, auto_cast pong.external_port}
+
+			_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
+			when ENABLE_PACKET_STATS {
+				_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
+			}
+		case .Encrypted:
+			if bytes.buffer_length(received_data) < size_of(sfp.FileSendRequest) {
+				return
+			}
+			file_send_request := cast(^sfp.FileSendRequest)raw_data(
+				bytes.buffer_next(received_data, size_of(sfp.FileSendRequest)),
+			)
+			payload: sfp.FileSendRequestPayload
+			if sfp.parse_sfp_file_send_request(g.my_secret_key, &payload, file_send_request) {
+				log.infof("Received file send request: %v", string(payload.file_name[:]))
+				_ = chan.try_send(
+					g.io_to_main,
+					NewFileSendRequest{payload, file_send_request.session_id},
+				)
+				when ENABLE_PACKET_STATS {
+					_ = chan.try_send(g.io_to_main, NewPacketStat{.FileSendRequest, .Incoming})
+				}
+			} else {
+				log.infof("Invlaid file send request: %v", string(payload.file_name[:]))
+				when ENABLE_PACKET_STATS {
+					_ = chan.try_send(g.io_to_main, NewPacketStat{.FileSendRequest, .Invalid})
+				}
+
+			}
+		case .Ping:
+			log.warnf("Received unexpected ping packet!")
+
+		}
+	} else {
+		bytes.buffer_reset(received_data)
+		log.infof("Received packet with invalid version: %X", packet_header.header.version)
+		when ENABLE_PACKET_STATS {
+			_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
+		}
+	}
+
 }
 build_gui :: proc(g: ^G) {
 	ContactSerialized :: struct #packed {

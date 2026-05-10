@@ -135,7 +135,8 @@ init_sfp_file_send_request :: proc(
 	out_packet: ^FileSendRequest,
 ) {
 	out_packet.version = VERSION
-	out_packet.packet_header.size = size_of(FileSendRequest)
+	out_packet.type = .Encrypted
+	out_packet.size = size_of(FileSendRequest)
 
 	//set up payload to be encrypted
 	payload: FileSendRequestPayload
