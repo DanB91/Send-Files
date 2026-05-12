@@ -597,7 +597,8 @@ build_gui :: proc(g: ^G) {
 			im.TableSetupColumn("Rate")
 			im.TableSetupColumn("Actions", {.NoSort})
 			im.TableHeadersRow()
-			for &tr, i in g.transfers {
+			for tr_id, i in g.transfers {
+				tr := pool_ptr_from_id(&g.transfer_pool, tr_id)
 				im.PushIDInt(auto_cast i)
 
 				im.TableNextColumn()
@@ -672,14 +673,16 @@ build_gui :: proc(g: ^G) {
 				session_id, sk := sfp.create_session_id()
 				contact := cast(^Contact)igfd.GetUserDatas(g.igfd_ctx)
 
-				transfer := create_transfer(
+				transfer_id := create_transfer(
 					file_name,
 					file_info.size,
 					contact^,
 					.OutgoingRequested,
 					session_id,
+					g,
 				)
-				append(&g.transfers, transfer)
+				append(&g.transfers, transfer_id)
+				transfer := pool_ptr_from_id(&g.transfer_pool, transfer_id)
 
 				packet := new(sfp.FileSendRequest, transfer.allocator)
 				sfp.init_sfp_file_send_request(
@@ -809,6 +812,7 @@ run_ui :: proc() {
 					counter_party,
 					.IncomingRequested,
 					command.session_id,
+					g,
 				)
 				append(&g.transfers, transfer)
 			}
@@ -956,10 +960,11 @@ G :: struct {
 
 	//Persistent State
 	contacts:            [dynamic; 4096]Contact,
-	transfers:           [dynamic; 4096]^Transfer,
+	transfers:           [dynamic; 4096]TransferID,
 	my_name:             string,
 	my_secret_key:       sfp.SecretKey,
 	my_address:          sfp.Address,
+	transfer_pool:       Pool(Transfer, TransferID, 4096),
 
 	//IO
 	io_event_loop:       ^nbio.Event_Loop,
@@ -1032,10 +1037,15 @@ create_transfer :: proc(
 	contact: Contact,
 	status: TransferStatus,
 	session_id: sfp.SessionID,
-) -> ^Transfer {
-	transfer_arena: mem.Arena
-	mem.arena_init(&transfer_arena, make([]byte, 512 * 1024, context.allocator))
-	transfer_allocator := mem.arena_allocator(&transfer_arena)
+	g: ^G,
+) -> TransferID {
+
+	transfer_arena := new(mem.Arena, context.allocator) or_else panic("OOM")
+	mem.arena_init(
+		transfer_arena,
+		make([]byte, 512 * 1024, context.allocator) or_else panic("OOM"),
+	)
+	transfer_allocator := mem.arena_allocator(transfer_arena)
 
 	file_slices_to_be_transfered := make([dynamic]FileSlice, transfer_allocator)
 	append(&file_slices_to_be_transfered, FileSlice{0, file_size})
@@ -1043,7 +1053,7 @@ create_transfer :: proc(
 
 	transfer_value := Transfer {
 		transfer_allocator,
-		strings.clone(file_name, transfer_allocator),
+		strings.clone(file_name, transfer_allocator) or_else panic("OOM"),
 		file_size,
 		contact,
 		status,
@@ -1052,11 +1062,11 @@ create_transfer :: proc(
 		session_id,
 	}
 
-	transfer := new(Transfer, transfer_allocator)
-	transfer^ = transfer_value
+	transfer := pool_alloc_and_init(&g.transfer_pool, transfer_value)
 
 	return transfer
 }
+TransferID :: distinct i64
 Transfer :: struct {
 	allocator:                    mem.Allocator,
 	file_name:                    string,
