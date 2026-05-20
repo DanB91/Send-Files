@@ -470,7 +470,6 @@ build_gui :: proc(g: ^G) {
 				im.SameLine()
 				if g.external_ip_address.port != 0 && im.Button("Send File") {
 					config := igfd.FileDialog_Config_Get()
-					//TODO fill out config
 					config.flags = {.Modal, .ReadOnlyFileNameField, .DisableCreateDirectoryButton}
 					config.user_datas = &contact
 					igfd.OpenDialog(
@@ -803,18 +802,20 @@ run_ui :: proc() {
 					stat.invalid += 1
 				}
 			case NewFileSendRequest:
-				//TODO add contact addres to NewFileSendRequest
-				request := command.request
-				counter_party := Contact{request.requester_name, request.requester_address}
-				transfer := create_transfer(
-					string(request.file_name[:]),
-					request.file_size,
-					counter_party,
-					.IncomingRequested,
-					command.session_id,
-					g,
-				)
-				append(&g.transfers, transfer)
+				transfer := transfer_for_session_id(command.session_id, g)
+				if transfer == nil {
+					request := command.request
+					counter_party := Contact{request.requester_name, request.requester_address}
+					transfer_id := create_transfer(
+						string(request.file_name[:]),
+						request.file_size,
+						counter_party,
+						.IncomingRequested,
+						command.session_id,
+						g,
+					)
+					append(&g.transfers, transfer_id)
+				}
 			}
 		}
 		imgui_impl_sdlgpu3.NewFrame()
@@ -862,6 +863,15 @@ run_ui :: proc() {
 	}
 
 
+}
+transfer_for_session_id :: proc(session_id: sfp.SessionID, g: ^G) -> ^Transfer {
+	for tid in g.transfers {
+		t := pool_ptr_from_id(&g.transfer_pool, tid)
+		if t.session_id == session_id {
+			return t
+		}
+	}
+	return nil
 }
 
 //TODO push lane context
