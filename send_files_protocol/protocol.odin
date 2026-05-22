@@ -128,8 +128,7 @@ init_sfp_file_send_request :: proc(
 	target_address: Address,
 	file_size: i64,
 	file_name: string,
-	requester_address: Address,
-	requester_name: string,
+	requester_contact: ^Contact,
 	reply_ip_address: nbio.IP4_Address,
 	reply_port: u16,
 	out_packet: ^FileSendRequest,
@@ -143,13 +142,11 @@ init_sfp_file_send_request :: proc(
 	{
 		payload.op = .FileSendRequest
 		payload.file_size = file_size
-		resize(&payload.file_name, len(file_name))
-		copy(payload.file_name[:], file_name[:])
-		resize(&payload.requester_name, len(requester_name))
-		copy(payload.requester_name[:], requester_name[:])
+		append(&payload.file_name, file_name)
+		append(&payload.requester_name, ..requester_contact.name[:])
 		payload.reply_ip_address = reply_ip_address
 		payload.reply_port = reply_port
-		payload.requester_address = requester_address
+		payload.requester_address = requester_contact.address
 	}
 
 
@@ -307,4 +304,9 @@ Op :: enum (i32) {
 	AcceptFileSendRequest,
 	FileData,
 	ResendFileData,
+}
+
+Contact :: struct {
+	name:    [dynamic; MAX_NAME_SIZE]byte,
+	address: Address,
 }
