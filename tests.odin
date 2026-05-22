@@ -38,6 +38,9 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 		REQUESTER_NAME :: "Dan"
 		IP_ADDR :: nbio.IP4_Address{127, 0, 0, 1}
 		PORT :: 12345
+		requester_contact: sfp.Contact
+		append(&requester_contact.name, REQUESTER_NAME)
+		requester_contact.address = target_address
 
 		sfp.init_sfp_file_send_request(
 			sender_ephemeral_secret_key,
@@ -45,8 +48,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 			target_address,
 			FILE_SIZE,
 			FILE_NAME,
-			target_address,
-			REQUESTER_NAME,
+			&requester_contact,
 			IP_ADDR,
 			PORT,
 			&packet,
@@ -86,14 +88,16 @@ test_sending_file_send_request :: proc() {
 		defer nbio.release_thread_event_loop()
 		session_id, ephemperal_sk := sfp.create_session_id()
 		file_send_request_packet: sfp.FileSendRequest
+		requester_contact: sfp.Contact
+		append(&requester_contact.name, REQUESTER_NAME)
+		requester_contact.address = receiver_address
 		sfp.init_sfp_file_send_request(
 			ephemperal_sk,
 			session_id,
 			receiver_address,
 			FILE_SIZE,
 			FILE_NAME,
-			receiver_address,
-			REQUESTER_NAME,
+			&requester_contact,
 			IP_ADDR,
 			PORT,
 			&file_send_request_packet,

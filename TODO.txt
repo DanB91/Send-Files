@@ -1,0 +1,2 @@
+- Make sure you can't paste your self as a contact
+- Disable Send File button when offline, instead of removing it

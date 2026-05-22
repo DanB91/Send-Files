@@ -31,7 +31,6 @@ import "core:prof/spall"
 import "core:strings"
 import "core:sync"
 import "core:sync/chan"
-import "core:sys/darwin/Foundation"
 import "core:sys/posix"
 import "core:thread"
 import "core:time"
@@ -161,8 +160,8 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 
 
 		//init placeholder values.  TODO: remove after we implement persistance
-		g.my_name = "Dan"
-		g.my_address, g.my_secret_key = sfp.create_address()
+		append(&g.my_contact_info.name, "Dan")
+		g.my_contact_info.address, g.my_secret_key = sfp.create_address()
 
 		io_to_main, err := chan.create(chan.Chan(MainThreadCommand), 1024, context.allocator)
 		ensure(err == nil)
@@ -355,7 +354,7 @@ build_gui :: proc(g: ^G) {
 		name_store: [sfp.MAX_NAME_SIZE]byte,
 		crc32:      u32,
 	}
-	ui_contact_text :: proc(contact: Contact) {
+	ui_contact_text :: proc(contact: sfp.Contact) {
 		contact := contact
 		address_string := base64.encode(contact.address[:], allocator = context.temp_allocator)
 		im.PushStyleColor(.Text, 0xFF_00_FF_00)
@@ -427,13 +426,13 @@ build_gui :: proc(g: ^G) {
 	{
 		im.BeginChild("Your Contact Info", child_flags = {.Borders, .AutoResizeY})
 		im.SeparatorText("Your Contact Info")
-		im.Text("%s", cstr(g.my_name))
+		ui_contact_text(g.my_contact_info)
 		im.SameLine()
 		if im.Button("Copy") {
 			contact_info: ContactSerialized
-			contact_info.address = g.my_address
-			contact_info.name_len = auto_cast len(g.my_name)
-			copy(contact_info.name_store[:], g.my_name[:])
+			contact_info.address = g.my_contact_info.address
+			contact_info.name_len = auto_cast len(g.my_contact_info.name)
+			copy(contact_info.name_store[:], g.my_contact_info.name[:])
 
 			crc: u32
 			init_crc32(&crc)
@@ -539,7 +538,7 @@ build_gui :: proc(g: ^G) {
 					if contact_info.name_len < len(contact_info.name_store) {
 						//TODO check if this is yourself
 						//TODO check if you already have this contact
-						contact: Contact
+						contact: sfp.Contact
 						contact.address = contact_info.address
 						append(
 							&contact.name,
@@ -635,7 +634,7 @@ build_gui :: proc(g: ^G) {
 	}
 	//TODO enable once we have persistence
 	//UI Section: Enter your name Dialog
-	if false && len(g.my_name) == 0 {
+	if false && len(g.my_contact_info.name) == 0 {
 		if im.BeginPopupModal("Enter your name") {
 			@(static) inputted_name: [sfp.MAX_NAME_SIZE]u8
 			im.Text("Please enter the name you want your contacts to know you by:")
@@ -670,7 +669,7 @@ build_gui :: proc(g: ^G) {
 			file_info, err := os.stat(path, context.temp_allocator)
 			if err == nil {
 				session_id, sk := sfp.create_session_id()
-				contact := cast(^Contact)igfd.GetUserDatas(g.igfd_ctx)
+				contact := cast(^sfp.Contact)igfd.GetUserDatas(g.igfd_ctx)
 
 				transfer_id := create_transfer(
 					file_name,
@@ -690,8 +689,7 @@ build_gui :: proc(g: ^G) {
 					contact.address,
 					file_info.size,
 					file_name,
-					g.my_address,
-					g.my_name,
+					&g.my_contact_info,
 					g.external_ip_address.address.(net.IP4_Address),
 					auto_cast g.external_ip_address.port,
 					packet,
@@ -805,7 +803,7 @@ run_ui :: proc() {
 				transfer := transfer_for_session_id(command.session_id, g)
 				if transfer == nil {
 					request := command.request
-					counter_party := Contact{request.requester_name, request.requester_address}
+					counter_party := sfp.Contact{request.requester_name, request.requester_address}
 					transfer_id := create_transfer(
 						string(request.file_name[:]),
 						request.file_size,
@@ -969,11 +967,10 @@ G :: struct {
 	packet_stats:        [PacketType.Count]PacketStat,
 
 	//Persistent State
-	contacts:            [dynamic; 4096]Contact,
+	contacts:            [dynamic; 4096]sfp.Contact,
 	transfers:           [dynamic; 4096]TransferID,
-	my_name:             string,
+	my_contact_info:     sfp.Contact,
 	my_secret_key:       sfp.SecretKey,
-	my_address:          sfp.Address,
 	transfer_pool:       Pool(Transfer, TransferID, 4096),
 
 	//IO
@@ -1037,14 +1034,10 @@ LaneContext :: struct {
 
 //File Transfer related
 
-Contact :: struct {
-	name:    [dynamic; sfp.MAX_NAME_SIZE]byte,
-	address: sfp.Address,
-}
 create_transfer :: proc(
 	file_name: string,
 	file_size: i64,
-	contact: Contact,
+	contact: sfp.Contact,
 	status: TransferStatus,
 	session_id: sfp.SessionID,
 	g: ^G,
@@ -1081,7 +1074,7 @@ Transfer :: struct {
 	allocator:                    mem.Allocator,
 	file_name:                    string,
 	file_size:                    i64,
-	counter_party:                Contact,
+	counter_party:                sfp.Contact,
 	status:                       TransferStatus,
 	file_slices_to_be_transfered: [dynamic]FileSlice,
 	rate:                         f64,
