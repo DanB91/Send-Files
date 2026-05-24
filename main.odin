@@ -37,7 +37,7 @@ import "core:time"
 import sfp "send_files_protocol"
 import "vendor:sdl3"
 
-INITIAL_WINDOW_WIDTH :: 800
+INITIAL_WINDOW_WIDTH :: 1000
 INITIAL_WINDOW_HEIGHT :: 800
 FONT_MULTIPLIER :: 1
 
@@ -283,8 +283,9 @@ multithread_entry_point :: proc(g: ^G, lane_ctx: LaneContext, spall_buffer: ^spa
 }
 try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 	packet_header: struct #raw_union {
-		header: sfp.PacketHeader,
-		bytes:  [size_of(sfp.PacketHeader)]byte,
+		header:            sfp.PacketHeader,
+		encryption_header: sfp.EncryptionHeader,
+		bytes:             [size_of(sfp.EncryptionHeader)]byte,
 	}
 
 	if (bytes.buffer_length(received_data) < size_of(packet_header)) {
@@ -298,19 +299,35 @@ try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 		cursor := size_of(sfp.PacketHeader)
 		switch packet_header.header.type {
 		case .Pong:
-			if bytes.buffer_length(received_data) < size_of(sfp.Pong) {
-				return
-			}
-			pong := cast(^sfp.Pong)raw_data(bytes.buffer_next(received_data, size_of(sfp.Pong)))
+			if bytes.buffer_length(received_data) >= size_of(sfp.Pong) {
+				pong := cast(^sfp.Pong)raw_data(
+					bytes.buffer_next(received_data, size_of(sfp.Pong)),
+				)
 
-			ip := net.Address(pong.external_ip)
-			endpoint := net.Endpoint{ip, auto_cast pong.external_port}
+				ip := net.Address(pong.external_ip)
+				endpoint := net.Endpoint{ip, auto_cast pong.external_port}
 
-			_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
-			when ENABLE_PACKET_STATS {
-				_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
+				_ = chan.try_send(g.io_to_main, NewIPAddress{endpoint})
+				when ENABLE_PACKET_STATS {
+					_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Incoming})
+				}
+			} else {
+				bytes.buffer_next(received_data, auto_cast packet_header.header.size)
+				log.infof("Got corrupted pong packet")
+
 			}
 		case .Encrypted:
+			// it should be > instead of >= since encryption packets always have a payload
+			// if bytes.buffer_length(received_data) > size_of(sfp.EncryptionHeader) {
+			// 	// payload := received_data.buf[size_of(sfp.EncryptionHeader):]
+
+			// } else {
+			// 	bytes.buffer_next(received_data, auto_cast packet_header.header.size)
+			// 	log.infof("Got corrupted encryption packet")
+
+			// }
+
+			//TODO handle FileSendRequestAccept
 			if bytes.buffer_length(received_data) < size_of(sfp.FileSendRequest) {
 				return
 			}
@@ -322,7 +339,7 @@ try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 				log.infof("Received file send request: %v", string(payload.file_name[:]))
 				_ = chan.try_send(
 					g.io_to_main,
-					NewFileSendRequest{payload, file_send_request.session_id},
+					NewFileSendRequest{payload, file_send_request.sender_address},
 				)
 				when ENABLE_PACKET_STATS {
 					_ = chan.try_send(g.io_to_main, NewPacketStat{.FileSendRequest, .Incoming})
@@ -339,7 +356,7 @@ try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 
 		}
 	} else {
-		bytes.buffer_reset(received_data)
+		bytes.buffer_next(received_data, auto_cast packet_header.header.size)
 		log.infof("Received packet with invalid version: %X", packet_header.header.version)
 		when ENABLE_PACKET_STATS {
 			_ = chan.try_send(g.io_to_main, NewPacketStat{.PingAndPong, .Invalid})
@@ -467,7 +484,9 @@ build_gui :: proc(g: ^G) {
 				im.TableNextColumn()
 				ui_contact_text(contact)
 				im.SameLine()
-				if g.external_ip_address.port != 0 && im.Button("Send File") {
+				disable_send_button := g.external_ip_address.port == 0
+				im.BeginDisabled(disable_send_button)
+				if im.Button("Send File") {
 					config := igfd.FileDialog_Config_Get()
 					config.flags = {.Modal, .ReadOnlyFileNameField, .DisableCreateDirectoryButton}
 					config.user_datas = &contact
@@ -505,6 +524,7 @@ build_gui :: proc(g: ^G) {
 					// }
 
 				}
+				im.EndDisabled()
 				im.TableNextColumn()
 				if im.Button("Copy") {
 
@@ -619,8 +639,27 @@ build_gui :: proc(g: ^G) {
 				im.Text("%.2f%", tr.rate / 100)
 
 				im.TableNextColumn()
-				if im.Button("Cancel") {}
 
+				#partial switch tr.status {
+				case .IncomingRequested:
+					if im.Button("Accept") {
+						//TODO
+						accept_transfer(tr, g)
+					}
+					im.SameLine()
+					if im.Button("Ignore") {
+						//TODO
+					}
+				case .OutgoingRequested:
+					if im.Button("Cancel") {
+						//TODO
+					}
+				case .OutgoingTransferring:
+					if im.Button("Cancel") {
+						//TODO
+					}
+
+				}
 
 				im.PopID()
 			}
@@ -668,7 +707,7 @@ build_gui :: proc(g: ^G) {
 			file_name := filepath.base(path)
 			file_info, err := os.stat(path, context.temp_allocator)
 			if err == nil {
-				session_id, sk := sfp.create_session_id()
+				session_id := sfp.create_session_id()
 				contact := cast(^sfp.Contact)igfd.GetUserDatas(g.igfd_ctx)
 
 				transfer_id := create_transfer(
@@ -684,7 +723,7 @@ build_gui :: proc(g: ^G) {
 
 				packet := new(sfp.FileSendRequest, transfer.allocator)
 				sfp.init_sfp_file_send_request(
-					sk,
+					g.my_secret_key,
 					session_id,
 					contact.address,
 					file_info.size,
@@ -753,6 +792,58 @@ build_gui :: proc(g: ^G) {
 
 }
 
+accept_transfer :: proc(transfer: ^Transfer, g: ^G) {
+	transfer.status = .IncomingAccepted
+
+	packet := new(sfp.FileSendRequestAccept, transfer.allocator)
+	sfp.init_sfp_file_send_request_accept(
+		g.my_secret_key,
+		transfer.counter_party.address,
+		transfer.session_id,
+		&g.my_contact_info,
+		packet,
+	)
+	repeat_accept_request_until_transfer_starts :: proc(
+		op: ^nbio.Operation,
+		packet: ^sfp.FileSendRequestAccept,
+		transfer: ^Transfer,
+		g: ^G,
+	) {
+
+		nbio.send_poly(g.socket, {mem.ptr_to_bytes(packet)}, g, proc(op: ^nbio.Operation, g: ^G) {
+				if op.send.err == nil {
+					when ENABLE_PACKET_STATS {
+						_ = chan.try_send(
+							g.io_to_main,
+							NewPacketStat{.FileSendRequestAccept, .Outgoing},
+						)
+					}
+				} else {
+					log.warnf("Error sending file send request: %v", op.send.err)
+				}
+			}, SERVER_ENDPOINT)
+		if transfer.status == .IncomingAccepted {
+			nbio.timeout_poly3(
+				5 * time.Second,
+				packet,
+				transfer,
+				g,
+				repeat_accept_request_until_transfer_starts,
+				g.io_event_loop,
+			)
+
+		}
+	}
+	nbio.timeout_poly3(
+		0,
+		packet,
+		transfer,
+		g,
+		repeat_accept_request_until_transfer_starts,
+		g.io_event_loop,
+	)
+
+}
 
 run_ui :: proc() {
 	g := tls.g
@@ -800,16 +891,16 @@ run_ui :: proc() {
 					stat.invalid += 1
 				}
 			case NewFileSendRequest:
-				transfer := transfer_for_session_id(command.session_id, g)
+				transfer := transfer_for_session_id(command.request.session_id, g)
 				if transfer == nil {
 					request := command.request
-					counter_party := sfp.Contact{request.requester_name, request.requester_address}
+					counter_party := sfp.Contact{request.requester_name, command.sender_address}
 					transfer_id := create_transfer(
 						string(request.file_name[:]),
 						request.file_size,
 						counter_party,
 						.IncomingRequested,
-						command.session_id,
+						request.session_id,
 						g,
 					)
 					append(&g.transfers, transfer_id)
@@ -1015,8 +1106,8 @@ NewPacketStat :: struct {
 	},
 }
 NewFileSendRequest :: struct {
-	request:    sfp.FileSendRequestPayload,
-	session_id: sfp.SessionID,
+	request:        sfp.FileSendRequestPayload,
+	sender_address: sfp.Address,
 }
 
 TLS :: struct {

@@ -41,7 +41,7 @@ create_pong_packet :: proc(external_ip: nbio.IP4_Address, external_port: u16) ->
 //unencrypted header containing only necessary information needed for decryption
 EncryptionHeader :: struct #packed {
 	using packet_header: PacketHeader,
-	session_id:          SessionID,
+	sender_address:      Address,
 	encryption_tag:      [chacha20poly1305.TAG_SIZE]byte,
 	encryption_nonce:    [chacha20poly1305.XIV_SIZE]byte,
 }
@@ -53,7 +53,7 @@ PublicKey :: distinct [x25519.POINT_SIZE]byte
 SecretKey :: distinct [x25519.SCALAR_SIZE]byte
 
 Address :: distinct PublicKey
-SessionID :: distinct PublicKey
+SessionID :: [16]byte
 
 create_key_pair :: proc() -> (public_key: PublicKey, secret_key: SecretKey) {
 	crypto.rand_bytes(secret_key[:])
@@ -61,10 +61,8 @@ create_key_pair :: proc() -> (public_key: PublicKey, secret_key: SecretKey) {
 	return
 }
 
-create_session_id :: proc() -> (session_id: SessionID, secret_key: SecretKey) {
-	pk, sk := create_key_pair()
-	session_id = auto_cast pk
-	secret_key = sk
+create_session_id :: proc() -> (session_id: SessionID) {
+	crypto.rand_bytes(session_id[:])
 	return
 }
 
@@ -98,7 +96,7 @@ FileSendRequestPayload :: struct #packed {
 	file_size:            i64,
 	file_name:            [dynamic; MAX_FILE_NAME_SIZE]byte,
 	requester_name:       [dynamic; MAX_NAME_SIZE]byte,
-	requester_address:    Address,
+	session_id:           SessionID,
 }
 
 
@@ -109,7 +107,7 @@ FileSendRequestPayload :: struct #packed {
 		4 +
 		4 +
 		32 +
-		32 +
+		16 +
 		16 +
 		24 +
 		4 +
@@ -121,9 +119,32 @@ FileSendRequestPayload :: struct #packed {
 		MAX_NAME_SIZE +
 		32,
 )
+decrypt_encryption_packet :: proc(
+	header: EncryptionHeader,
+	secret_key: SecretKey,
+	in_out_payload: []byte,
+) -> bool {
+	encryption_key: SecretKey
+	{
+
+		secret_key := secret_key
+		sender_address := header.sender_address
+		//Uhhh I haven't thought this out as much as I should have (as usual)
+		//The issue is that the file send request is encrypted with the ephmeral private key that is associated with the session id
+		//But, don't we want the packets to be encrypted with the sender's public key?
+		//How do we incorporate both the sender's public key and the ephmeral session id?
+		x25519.scalarmult(encryption_key[:], secret_key[:], sender_address[:])
+
+		sha_ctx: sha2.Context_256
+		sha2.init_256(&sha_ctx)
+		sha2.update(&sha_ctx, encryption_key[:])
+		sha2.final(&sha_ctx, encryption_key[:])
+	}
+	return false
+}
 
 init_sfp_file_send_request :: proc(
-	ephemeral_secret_key: SecretKey,
+	secret_key: SecretKey,
 	session_id: SessionID,
 	target_address: Address,
 	file_size: i64,
@@ -146,19 +167,19 @@ init_sfp_file_send_request :: proc(
 		append(&payload.requester_name, ..requester_contact.name[:])
 		payload.reply_ip_address = reply_ip_address
 		payload.reply_port = reply_port
-		payload.requester_address = requester_contact.address
+		payload.session_id = session_id
 	}
 
 
 	//calculate the encryption key
 	encryption_key: SecretKey
 	{
-		ephemeral_secret_key := ephemeral_secret_key
-		out_packet.session_id = session_id
+		secret_key := secret_key
+		out_packet.sender_address = requester_contact.address
 
 		out_packet.target_address = target_address
 
-		x25519.scalarmult(encryption_key[:], ephemeral_secret_key[:], out_packet.target_address[:])
+		x25519.scalarmult(encryption_key[:], secret_key[:], out_packet.target_address[:])
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)
@@ -196,7 +217,7 @@ parse_sfp_file_send_request :: proc(
 			return false
 		}
 
-		x25519.scalarmult(encryption_key[:], target_secret_key[:], in_packet.session_id[:])
+		x25519.scalarmult(encryption_key[:], target_secret_key[:], in_packet.sender_address[:])
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)
@@ -230,13 +251,14 @@ FileSendRequestAccept :: struct #packed {
 	encrypted_payload: [size_of(FileSendRequestAcceptPayload)]byte,
 }
 FileSendRequestAcceptPayload :: struct #packed {
-	using header:     PacketPayloadHeader,
-	receiver_address: Address, //used for validation purposes
+	using header: PacketPayloadHeader,
+	session_id:   SessionID,
 }
 init_sfp_file_send_request_accept :: proc(
 	secret_key: SecretKey,
 	receiver_address: Address,
 	session_id: SessionID,
+	my_contact_info: ^Contact,
 	out_packet: ^FileSendRequestAccept,
 ) {
 	secret_key := secret_key
@@ -246,18 +268,15 @@ init_sfp_file_send_request_accept :: proc(
 	payload: FileSendRequestAcceptPayload
 	{
 		payload.op = .AcceptFileSendRequest
-		payload.receiver_address = receiver_address
+		payload.session_id = session_id
 	}
 
 
 	//calculate the encryption key
 	encryption_key: SecretKey
 	{
-		x25519.scalarmult_basepoint(out_packet.session_id[:], secret_key[:])
-
-
-		session_id := session_id
-		x25519.scalarmult(encryption_key[:], secret_key[:], session_id[:])
+		out_packet.sender_address = my_contact_info.address
+		x25519.scalarmult(encryption_key[:], secret_key[:], my_contact_info.address[:])
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)

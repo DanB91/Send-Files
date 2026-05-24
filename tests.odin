@@ -27,7 +27,7 @@ run_tests :: proc() {
 
 test_constructing_parsing_file_send_request_packet :: proc() {
 	if is_main_thread() {
-		session_id, sender_ephemeral_secret_key := sfp.create_session_id()
+		session_id := sfp.create_session_id()
 		target_address, target_master_secret_key := sfp.create_address()
 
 
@@ -43,7 +43,7 @@ test_constructing_parsing_file_send_request_packet :: proc() {
 		requester_contact.address = target_address
 
 		sfp.init_sfp_file_send_request(
-			sender_ephemeral_secret_key,
+			target_master_secret_key,
 			session_id,
 			target_address,
 			FILE_SIZE,
@@ -86,13 +86,13 @@ test_sending_file_send_request :: proc() {
 	if is_main_thread() {
 		nbio.acquire_thread_event_loop()
 		defer nbio.release_thread_event_loop()
-		session_id, ephemperal_sk := sfp.create_session_id()
+		session_id := sfp.create_session_id()
 		file_send_request_packet: sfp.FileSendRequest
 		requester_contact: sfp.Contact
 		append(&requester_contact.name, REQUESTER_NAME)
 		requester_contact.address = receiver_address
 		sfp.init_sfp_file_send_request(
-			ephemperal_sk,
+			receiver_master_sk,
 			session_id,
 			receiver_address,
 			FILE_SIZE,
