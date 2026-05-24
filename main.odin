@@ -288,7 +288,7 @@ try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 		bytes:             [size_of(sfp.EncryptionHeader)]byte,
 	}
 
-	if (bytes.buffer_length(received_data) < size_of(packet_header)) {
+	if (bytes.buffer_length(received_data) < size_of(sfp.PacketHeader)) {
 		return
 	}
 	copy(packet_header.bytes[:], received_data.buf[received_data.off:])

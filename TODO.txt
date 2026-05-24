@@ -1,2 +1,4 @@
 - Make sure you can't paste your self as a contact
-- Disable Send File button when offline, instead of removing it
+- Add cancel action for accepted transfer
+
+X Disable Send File button when offline, instead of removing it
