@@ -42,6 +42,7 @@ create_pong_packet :: proc(external_ip: nbio.IP4_Address, external_port: u16) ->
 EncryptionHeader :: struct #packed {
 	using packet_header: PacketHeader,
 	sender_address:      Address,
+	target_address:      Address,
 	encryption_tag:      [chacha20poly1305.TAG_SIZE]byte,
 	encryption_nonce:    [chacha20poly1305.XIV_SIZE]byte,
 }
@@ -86,7 +87,6 @@ validate_sfp_address_is_mine :: proc(address: Address, secret_key: SecretKey) ->
 
 FileSendRequest :: struct #packed {
 	using encryption_header: EncryptionHeader,
-	target_address:          Address,
 	encrypted_payload:       [size_of(FileSendRequestPayload)]byte,
 }
 FileSendRequestPayload :: struct #packed {
@@ -124,15 +124,12 @@ decrypt_encryption_packet :: proc(
 	secret_key: SecretKey,
 	in_out_payload: []byte,
 ) -> bool {
+	header := header
 	encryption_key: SecretKey
 	{
 
 		secret_key := secret_key
 		sender_address := header.sender_address
-		//Uhhh I haven't thought this out as much as I should have (as usual)
-		//The issue is that the file send request is encrypted with the ephmeral private key that is associated with the session id
-		//But, don't we want the packets to be encrypted with the sender's public key?
-		//How do we incorporate both the sender's public key and the ephmeral session id?
 		x25519.scalarmult(encryption_key[:], secret_key[:], sender_address[:])
 
 		sha_ctx: sha2.Context_256
@@ -140,7 +137,16 @@ decrypt_encryption_packet :: proc(
 		sha2.update(&sha_ctx, encryption_key[:])
 		sha2.final(&sha_ctx, encryption_key[:])
 	}
-	return false
+	decrypted := aead.open_oneshot(
+		.XCHACHA20POLY1305,
+		in_out_payload[:],
+		encryption_key[:],
+		header.encryption_nonce[:],
+		nil,
+		in_out_payload[:],
+		header.encryption_tag[:],
+	)
+	return decrypted
 }
 
 init_sfp_file_send_request :: proc(
@@ -180,6 +186,12 @@ init_sfp_file_send_request :: proc(
 		out_packet.target_address = target_address
 
 		x25519.scalarmult(encryption_key[:], secret_key[:], out_packet.target_address[:])
+		log.infof(
+			"Encrypt SK: %v, PK: %v, Result: %v",
+			secret_key,
+			out_packet.target_address,
+			encryption_key,
+		)
 
 		sha_ctx: sha2.Context_256
 		sha2.init_256(&sha_ctx)

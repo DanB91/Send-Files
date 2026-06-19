@@ -318,39 +318,40 @@ try_process_received_data :: proc(received_data: ^bytes.Buffer, g: ^G) {
 			}
 		case .Encrypted:
 			// it should be > instead of >= since encryption packets always have a payload
-			// if bytes.buffer_length(received_data) > size_of(sfp.EncryptionHeader) {
-			// 	// payload := received_data.buf[size_of(sfp.EncryptionHeader):]
+			if bytes.buffer_length(received_data) > size_of(sfp.EncryptionHeader) {
 
-			// } else {
-			// 	bytes.buffer_next(received_data, auto_cast packet_header.header.size)
-			// 	log.infof("Got corrupted encryption packet")
+				payload := received_data.buf[size_of(sfp.EncryptionHeader):]
+				log.infof("Receiving payload: %v", payload[0:4])
+				header := packet_header.encryption_header
+				decrypted := sfp.decrypt_encryption_packet(header, g.my_secret_key, payload)
+				if decrypted {
+					payload_header := cast(^sfp.PacketPayloadHeader)raw_data(payload)
+					#partial switch payload_header.op {
+					case .FileSendRequest:
+						payload: ^sfp.FileSendRequestPayload = auto_cast payload_header
+						log.infof("Received file send request: %v", string(payload.file_name[:]))
+						_ = chan.try_send(
+							g.io_to_main,
+							NewFileSendRequest{payload^, header.sender_address},
+						)
+						when ENABLE_PACKET_STATS {
+							_ = chan.try_send(
+								g.io_to_main,
+								NewPacketStat{.FileSendRequest, .Incoming},
+							)
+						}
+					}
 
-			// }
-
-			//TODO handle FileSendRequestAccept
-			if bytes.buffer_length(received_data) < size_of(sfp.FileSendRequest) {
-				return
-			}
-			file_send_request := cast(^sfp.FileSendRequest)raw_data(
-				bytes.buffer_next(received_data, size_of(sfp.FileSendRequest)),
-			)
-			payload: sfp.FileSendRequestPayload
-			if sfp.parse_sfp_file_send_request(g.my_secret_key, &payload, file_send_request) {
-				log.infof("Received file send request: %v", string(payload.file_name[:]))
-				_ = chan.try_send(
-					g.io_to_main,
-					NewFileSendRequest{payload, file_send_request.sender_address},
-				)
-				when ENABLE_PACKET_STATS {
-					_ = chan.try_send(g.io_to_main, NewPacketStat{.FileSendRequest, .Incoming})
+				} else {
+					//TODO
+					log.info("Failed to decrypt payload")
 				}
+
 			} else {
-				log.infof("Invlaid file send request: %v", string(payload.file_name[:]))
-				when ENABLE_PACKET_STATS {
-					_ = chan.try_send(g.io_to_main, NewPacketStat{.FileSendRequest, .Invalid})
-				}
-
+				log.infof("Got corrupted encryption packet")
 			}
+			bytes.buffer_next(received_data, auto_cast packet_header.header.size)
+
 		case .Ping:
 			log.warnf("Received unexpected ping packet!")
 
